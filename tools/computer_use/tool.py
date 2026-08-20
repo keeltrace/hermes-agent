@@ -400,19 +400,9 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                 if sid == "":
                     _backend = None
             else:
-                provider = active_computer_use_provider()
-
-                # Ask before building. A provider that knows its runtime is
-                # gone (container pool down, lease expired) says so in one
-                # cheap call; letting create_backend/start() discover it
-                # instead costs a spawn timeout and reports the symptom rather
-                # than the cause.
-                if not provider.is_available():
-                    raise RuntimeError(
-                        f"computer_use provider {provider.name!r} is not available"
-                    )
-
-                backend = provider.create_backend(sid, permission_mode)
+                backend = active_computer_use_provider().create_backend(
+                    sid, permission_mode
+                )
                 # Starting under the cache lock preserves the existing
                 # one-backend-per-session invariant. A concurrent mode toggle
                 # releases this backend before returning to its caller.
@@ -679,8 +669,17 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         if err is not None:
             return err
 
-    # Dispatch to backend.
+    # Dispatch to backend. Ask the provider before building: one that knows
+    # its runtime is gone (container pool down, lease expired) says so in a
+    # cheap call, where letting create_backend/start() discover it costs a
+    # spawn timeout and reports the symptom rather than the cause.
     try:
+        provider = active_computer_use_provider()
+        if not provider.is_available():
+            return json.dumps({
+                "error": f"computer_use provider {provider.name!r} is not available",
+            })
+
         backend = _get_backend(session_id=session_id)
     except UnknownComputerUseProvider as e:
         # Its message already names the missing provider and how to fix it;

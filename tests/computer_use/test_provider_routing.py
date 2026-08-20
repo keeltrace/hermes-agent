@@ -128,17 +128,6 @@ class TestSelection:
 
         assert clean_provider.created[0][1] == "bounded"
 
-    def test_an_unavailable_provider_fails_before_it_is_asked_to_build(self, clean_provider):
-        """A provider that knows its runtime is gone says so in one cheap call;
-        discovering it inside start() costs a spawn timeout and reports the
-        symptom instead of the cause."""
-        clean_provider.available = False
-
-        with pytest.raises(RuntimeError, match="not available"):
-            cu_tool._get_backend(session_id="s1")
-
-        assert clean_provider.created == []
-
     def test_a_missing_provider_reaches_the_model_as_the_fix(self, monkeypatch):
         monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "webtop-pool")
         cu_tool.reset_backend_for_tests()
@@ -279,3 +268,16 @@ class TestAvailabilityGate:
 
         with patch.object(cu_tool.sys, "platform", "freebsd13"):
             assert cu_tool.check_computer_use_requirements() is False
+
+    def test_an_absent_provider_is_refused_before_anything_is_spawned(
+        self, clean_provider
+    ):
+        """The cheap answer beats the expensive one: a provider whose runtime
+        is gone reports the cause here, instead of a start() spawn timeout
+        reporting the symptom minutes later."""
+        clean_provider.available = False
+
+        result = json.loads(cu_tool.handle_computer_use({"action": "screenshot"}))
+
+        assert "not available" in result["error"]
+        assert clean_provider.created == []

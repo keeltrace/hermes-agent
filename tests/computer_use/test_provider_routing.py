@@ -269,15 +269,16 @@ class TestAvailabilityGate:
         with patch.object(cu_tool.sys, "platform", "freebsd13"):
             assert cu_tool.check_computer_use_requirements() is False
 
-    def test_an_absent_provider_is_refused_before_anything_is_spawned(
+    def test_a_provider_that_refuses_to_build_reports_the_cause_not_a_timeout(
         self, clean_provider
     ):
-        """The cheap answer beats the expensive one: a provider whose runtime
-        is gone reports the cause here, instead of a start() spawn timeout
-        reporting the symptom minutes later."""
-        clean_provider.available = False
+        """A provider that knows its runtime is gone says so from
+        create_backend, before anything is spawned — the cheap answer, rather
+        than a start() timeout reporting the symptom minutes later."""
+        clean_provider.create_backend = MagicMock(
+            side_effect=RuntimeError("webtop pool is down")
+        )
 
         result = json.loads(cu_tool.handle_computer_use({"action": "screenshot"}))
 
-        assert "not available" in result["error"]
-        assert clean_provider.created == []
+        assert "webtop pool is down" in result["error"]

@@ -76,8 +76,15 @@ class ComputerUseProvider(abc.ABC):
         cannot change after driver startup, which is why it is a construction
         argument rather than something the backend reads for itself.
 
-        May raise: the dispatcher reports the failure as
-        ``computer_use backend unavailable``.
+        Raise here when the runtime is known to be gone — a container pool
+        that is down, an expired lease. Nothing has been spawned yet, so the
+        dispatcher reports the cause as ``computer_use backend unavailable``
+        instead of the symptom a start() timeout would produce minutes later.
+        Answering that question is each provider's own, because the cheap
+        check that is right for a leased sandbox is wrong for the host: an
+        absent cua-driver binary already gates the tool out of the schema,
+        and re-checking it here would only refuse calls the caller has
+        deliberately pointed at a backend of their own.
         """
 
     def emergency_cleanup(self) -> None:

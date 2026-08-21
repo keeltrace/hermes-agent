@@ -4,6 +4,7 @@ import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
+import { contextUsageSnapshot } from '@/lib/context-usage-source'
 import { triggerHaptic } from '@/lib/haptics'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
 import { clearClarifyRequest } from '@/store/clarify'
@@ -372,16 +373,22 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     }
 
     if (payload?.usage) {
-      // Per-session twin FIRST (the statusbar reads it for focused tiles);
-      // the primary-only global mirrors the ACTIVE session — ungated it
-      // let a background tile's turn overwrite the primary's count.
+      const usage = payload.usage
+      const contextUsage = contextUsageSnapshot(usage)
+
       updateSessionState(sessionId, state => ({
         ...state,
-        usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...payload.usage }
+        usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...usage },
+        ...(contextUsage
+          ? {
+              contextUsage,
+              contextUsageEpoch: state.contextTurnEpoch ?? 0
+            }
+          : {})
       }))
 
       if (isActiveEvent) {
-        setCurrentUsage(current => ({ ...current, ...payload.usage }))
+        setCurrentUsage(current => ({ ...current, ...usage }))
       }
     }
 

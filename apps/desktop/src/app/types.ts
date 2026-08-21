@@ -212,6 +212,18 @@ export interface ClientSessionState {
    *  False while a submit is only optimistically armed — the discriminator the
    *  no-payload settle gate needs now that turnStartedAt is seeded at send. */
   turnLive: boolean
+  /** Monotonic per-session turn generation. The central session-state
+   *  write path increments it exactly on busy false→true, so every way a turn
+   *  starts (submit, resume/adoption, background work) shares one freshness
+   *  clock instead of inferring authority from the focused UI. */
+  contextTurnEpoch?: number
+  /** Latest session-scoped context occupancy reported by the gateway. Kept
+   *  across turns as a trustworthy fallback; contextUsageEpoch says which
+   *  turn produced it. */
+  contextUsage?: null | Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used'>
+  /** contextTurnEpoch that produced contextUsage, or null before any measured
+   *  context frame has arrived. */
+  contextUsageEpoch?: null | number
   /** Cumulative token usage, updated per completed turn. Per-session twin of
    *  the primary-only $currentUsage — the statusbar reads it for a focused
    *  tile's context count. Null until the first turn reports. */

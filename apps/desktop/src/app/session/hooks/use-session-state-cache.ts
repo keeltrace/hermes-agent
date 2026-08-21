@@ -5,6 +5,7 @@ import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { stampContextTurnEpoch } from '@/lib/context-usage-source'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
@@ -321,16 +322,22 @@ export function useSessionStateCache({
       // the param was always a fresh spread, so every call looked like a
       // change — including periodic ~1/s session.info heartbeats that churn
       // $sessionStates and its computed atoms on every tick.
-      const next = updater(previous)
+      const updated = updater(previous)
 
       // If the updater returned the same reference, nothing changed for this
       // session — skip the store write, publishSessionState, and view sync.
       // The cache entry was already updated by ensureSessionState (if
       // storedSessionId rotated); the caller gets its return value from the
       // cache, so stale reads don't regress.
-      if (next === previous) {
+      if (updated === previous) {
         return previous
       }
+
+      // One provenance clock for every way a turn can start. Doing this at the
+      // session-state chokepoint means optimistic submits, message.start,
+      // resumed/adopted turns, tiles, and background sessions cannot disagree
+      // about whether a context-usage frame belongs to the current turn.
+      const next = stampContextTurnEpoch(previous, updated)
 
       sessionStateCache.set(sessionId, next)
       // Crash-survivable turn progress: journal the running turn's visible

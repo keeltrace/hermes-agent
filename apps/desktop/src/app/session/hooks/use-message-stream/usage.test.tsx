@@ -49,6 +49,77 @@ describe('useMessageStream status-bar usage scoping', () => {
       input: 1200,
       total: 1280
     })
+    expect(sessionStates.get(SID)?.contextUsage).toEqual({ context_percent: 42 })
+    expect(sessionStates.get(SID)?.contextUsageEpoch).toBe(0)
+  })
+
+  it('tags only context-bearing usage with the session current turn generation', () => {
+    // The stream harness owns an intentionally minimal updateSessionState fake;
+    // epoch advancement itself is tested at stampContextTurnEpoch. Seed the
+    // already-live generation here and test this layer's responsibility:
+    // attributing context measurements to that generation.
+    sessionStates.set(SID, {
+      ...createClientSessionState(),
+      busy: true,
+      contextTurnEpoch: 1,
+      usage: { ...BASELINE }
+    })
+    mountStream()
+
+    act(() =>
+      stream.handleEvent({
+        payload: {
+          usage: {
+            context_max: 272_000,
+            context_percent: 42,
+            context_used: 114_240
+          }
+        },
+        session_id: SID,
+        type: 'session.usage'
+      })
+    )
+
+    expect(sessionStates.get(SID)?.contextUsage).toEqual({
+      context_max: 272_000,
+      context_percent: 42,
+      context_used: 114_240
+    })
+    expect(sessionStates.get(SID)?.contextUsageEpoch).toBe(1)
+
+    // Model the next generation at the session-cache boundary. The prior
+    // occupancy remains available as fallback but is deliberately stale.
+    sessionStates.set(SID, {
+      ...sessionStates.get(SID)!,
+      busy: true,
+      contextTurnEpoch: 2
+    })
+
+    // A totals-only tick is not current prompt occupancy and must not bless the
+    // prior turn's context snapshot as if it belonged to this turn.
+    act(() =>
+      stream.handleEvent({
+        payload: { usage: { input: 2000, total: 2090 } },
+        session_id: SID,
+        type: 'session.usage'
+      })
+    )
+
+    expect(sessionStates.get(SID)?.contextUsageEpoch).toBe(1)
+
+    act(() =>
+      stream.handleEvent({
+        payload: { usage: { context_percent: 51, context_used: 138_720 } },
+        session_id: SID,
+        type: 'session.usage'
+      })
+    )
+
+    expect(sessionStates.get(SID)?.contextUsageEpoch).toBe(2)
+    expect(sessionStates.get(SID)?.contextUsage).toEqual({
+      context_percent: 51,
+      context_used: 138_720
+    })
   })
 
   it('caches a background session.usage tick without overwriting the primary status bar', () => {
@@ -76,13 +147,37 @@ describe('useMessageStream status-bar usage scoping', () => {
 
     act(() =>
       stream.handleEvent({
-        payload: { text: 'done', usage: { calls: 3, input: 1500, output: 90, total: 1590 } },
+        payload: {
+          text: 'done',
+          usage: {
+            calls: 3,
+            context_max: 272_000,
+            context_percent: 51,
+            context_used: 138_720,
+            input: 1500,
+            output: 90,
+            total: 1590
+          }
+        },
         session_id: SID,
         type: 'message.complete'
       })
     )
 
-    expect($currentUsage.get()).toEqual({ calls: 3, input: 1500, output: 90, total: 1590 })
+    expect($currentUsage.get()).toEqual({
+      calls: 3,
+      context_max: 272_000,
+      context_percent: 51,
+      context_used: 138_720,
+      input: 1500,
+      output: 90,
+      total: 1590
+    })
+    expect(sessionStates.get(SID)?.contextUsage).toEqual({
+      context_max: 272_000,
+      context_percent: 51,
+      context_used: 138_720
+    })
   })
 
   it('ignores message.complete usage from a background session', () => {

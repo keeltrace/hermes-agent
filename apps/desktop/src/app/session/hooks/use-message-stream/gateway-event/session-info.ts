@@ -1,4 +1,5 @@
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { contextUsageSnapshot } from '@/lib/context-usage-source'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
@@ -325,6 +326,22 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       }
     }
 
+    if (payload?.usage && sessionId) {
+      const usage = payload.usage
+      const contextUsage = contextUsageSnapshot(usage)
+
+      updateSessionState(sessionId, state => ({
+        ...state,
+        usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...usage },
+        ...(contextUsage
+          ? {
+              contextUsage,
+              contextUsageEpoch: state.contextTurnEpoch ?? 0
+            }
+          : {})
+      }))
+    }
+
     if (payload?.usage && (!explicitSid || isActiveEvent)) {
       setCurrentUsage(current => ({ ...current, ...payload.usage }))
     }
@@ -354,15 +371,26 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // _start_usage_ticker) so the status-bar context window tracks growth
     // during the turn instead of only jumping at message.complete.
     if (payload?.usage && sessionId) {
+      const usage = payload.usage
+      const contextUsage = contextUsageSnapshot(usage)
+
       // Per-session twin first: a focused secondary tile reads this cache,
-      // while the primary-only global mirrors the active session.
+      // while the primary-only global mirrors the active session. Context
+      // occupancy is additionally stamped with the current turn generation,
+      // so source selection can prove freshness instead of guessing from busy.
       updateSessionState(sessionId, state => ({
         ...state,
-        usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...payload.usage }
+        usage: { calls: 0, input: 0, output: 0, total: 0, ...state.usage, ...usage },
+        ...(contextUsage
+          ? {
+              contextUsage,
+              contextUsageEpoch: state.contextTurnEpoch ?? 0
+            }
+          : {})
       }))
 
       if (isActiveEvent) {
-        setCurrentUsage(current => ({ ...current, ...payload.usage }))
+        setCurrentUsage(current => ({ ...current, ...usage }))
       }
     }
 

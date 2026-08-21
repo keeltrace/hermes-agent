@@ -7,7 +7,15 @@ interface ContextBreakdownOptions {
   enabled: boolean
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   sessionId: null | string
+  turnEpoch: number
 }
+
+interface CachedBreakdown {
+  breakdown: ContextBreakdown
+  turnEpoch: number
+}
+
+const MAX_CACHED_BREAKDOWNS = 8
 
 /** The focused session's context breakdown, fetched as soon as the statusbar
  *  gauge is on screen rather than when its popover opens.
@@ -21,17 +29,22 @@ interface ContextBreakdownOptions {
  *  prompt-cache impact.
  *
  *  Refetches when the focused session changes and when a turn ends (the
- *  transcript just grew). Held keyed by the session it describes so switching
- *  sessions drops the previous numbers instead of painting them under the new
- *  session's name. */
-export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }: ContextBreakdownOptions) {
-  const [fetched, setFetched] = useState<{ breakdown: ContextBreakdown; sessionId: string } | null>(null)
+ *  transcript just grew). The small per-session cache is intentionally retained
+ *  during a turn: it is the last trustworthy fallback until a session-scoped
+ *  live occupancy frame for the new turn arrives. Each entry carries the turn
+ *  epoch it describes, so the statusbar resolver can replace it exactly when a
+ *  newer source becomes authoritative. */
+export function useContextBreakdown({ busy, enabled, requestGateway, sessionId, turnEpoch }: ContextBreakdownOptions) {
+  const [fetchedBySession, setFetchedBySession] = useState<Map<string, CachedBreakdown>>(() => new Map())
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
     // Mid-turn the transcript changes on every delta and the gateway already
-    // streams measured usage, so an estimate would be both stale and wasteful.
+    // streams measured usage, so a new estimate would be both stale and
+    // wasteful. Keep the cached pre-turn snapshot as fallback instead.
     if (!enabled || !sessionId || busy) {
+      setLoading(false)
+
       return
     }
 
@@ -41,7 +54,23 @@ export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }
     void requestGateway<ContextBreakdown>('session.context_breakdown', { session_id: sessionId })
       .then(breakdown => {
         if (!cancelled && breakdown) {
-          setFetched({ breakdown, sessionId })
+          setFetchedBySession(current => {
+            const next = new Map(current)
+            next.delete(sessionId)
+            next.set(sessionId, { breakdown, turnEpoch })
+
+            while (next.size > MAX_CACHED_BREAKDOWNS) {
+              const oldest = next.keys().next().value
+
+              if (!oldest) {
+                break
+              }
+
+              next.delete(oldest)
+            }
+
+            return next
+          })
         }
       })
       .catch(() => undefined)
@@ -54,10 +83,13 @@ export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }
     return () => {
       cancelled = true
     }
-  }, [busy, enabled, requestGateway, sessionId])
+  }, [busy, enabled, requestGateway, sessionId, turnEpoch])
+
+  const fetched = sessionId ? (fetchedBySession.get(sessionId) ?? null) : null
 
   return {
-    breakdown: fetched && fetched.sessionId === sessionId ? fetched.breakdown : null,
+    breakdown: fetched?.breakdown ?? null,
+    breakdownEpoch: fetched?.turnEpoch ?? null,
     loading
   }
 }

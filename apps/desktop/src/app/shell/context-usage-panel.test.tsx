@@ -36,10 +36,17 @@ describe('useContextBreakdown', () => {
     const requestGateway = vi.fn().mockResolvedValue(breakdown)
 
     const { result } = renderHook(() =>
-      useContextBreakdown({ busy: false, enabled: true, requestGateway, sessionId: 'runtime-1' })
+      useContextBreakdown({
+        busy: false,
+        enabled: true,
+        requestGateway,
+        sessionId: 'runtime-1',
+        turnEpoch: 0
+      })
     )
 
     await waitFor(() => expect(result.current.breakdown).toEqual(breakdown))
+    expect(result.current.breakdownEpoch).toBe(0)
     expect(requestGateway).toHaveBeenCalledWith('session.context_breakdown', { session_id: 'runtime-1' })
   })
 
@@ -47,7 +54,14 @@ describe('useContextBreakdown', () => {
     const requestGateway = vi.fn().mockResolvedValue(breakdown)
 
     const { rerender } = renderHook(
-      ({ enabled }) => useContextBreakdown({ busy: false, enabled, requestGateway, sessionId: 'runtime-1' }),
+      ({ enabled }) =>
+        useContextBreakdown({
+          busy: false,
+          enabled,
+          requestGateway,
+          sessionId: 'runtime-1',
+          turnEpoch: 0
+        }),
       { initialProps: { enabled: false } }
     )
 
@@ -58,26 +72,85 @@ describe('useContextBreakdown', () => {
     await waitFor(() => expect(requestGateway).toHaveBeenCalledTimes(1))
   })
 
-  it('skips the estimate mid-turn — the gateway streams measured usage then', () => {
+  it('retains the last trusted breakdown when a new turn becomes busy', async () => {
     const requestGateway = vi.fn().mockResolvedValue(breakdown)
 
-    renderHook(() => useContextBreakdown({ busy: true, enabled: true, requestGateway, sessionId: 'runtime-1' }))
+    const { rerender, result } = renderHook(
+      ({ busy, turnEpoch }) =>
+        useContextBreakdown({
+          busy,
+          enabled: true,
+          requestGateway,
+          sessionId: 'runtime-1',
+          turnEpoch
+        }),
+      { initialProps: { busy: false, turnEpoch: 0 } }
+    )
 
-    expect(requestGateway).not.toHaveBeenCalled()
+    await waitFor(() => expect(result.current.breakdown).toEqual(breakdown))
+
+    rerender({ busy: true, turnEpoch: 1 })
+
+    expect(result.current.breakdown).toEqual(breakdown)
+    expect(result.current.breakdownEpoch).toBe(0)
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps cached breakdowns session-keyed when switching back mid-turn', async () => {
+    const breakdown2 = { ...breakdown, context_used: 12_000, model: 'other-model' }
+
+    const requestGateway = vi
+      .fn()
+      .mockImplementation((_method, params) =>
+        Promise.resolve(params?.session_id === 'runtime-1' ? breakdown : breakdown2)
+      )
+
+    const { rerender, result } = renderHook(
+      ({ busy, sessionId, turnEpoch }) =>
+        useContextBreakdown({
+          busy,
+          enabled: true,
+          requestGateway,
+          sessionId,
+          turnEpoch
+        }),
+      {
+        initialProps: {
+          busy: false,
+          sessionId: 'runtime-1',
+          turnEpoch: 0
+        }
+      }
+    )
+
+    await waitFor(() => expect(result.current.breakdown).toEqual(breakdown))
+
+    rerender({ busy: false, sessionId: 'runtime-2', turnEpoch: 0 })
+    await waitFor(() => expect(result.current.breakdown).toEqual(breakdown2))
+
+    rerender({ busy: true, sessionId: 'runtime-1', turnEpoch: 1 })
+
+    expect(result.current.breakdown).toEqual(breakdown)
+    expect(result.current.breakdownEpoch).toBe(0)
   })
 
   it('refetches on a session switch and never reports the previous session numbers', async () => {
     const requestGateway = vi.fn().mockResolvedValue(breakdown)
 
     const { rerender, result } = renderHook(
-      ({ sessionId }) => useContextBreakdown({ busy: false, enabled: true, requestGateway, sessionId }),
+      ({ sessionId }) =>
+        useContextBreakdown({
+          busy: false,
+          enabled: true,
+          requestGateway,
+          sessionId,
+          turnEpoch: 0
+        }),
       { initialProps: { sessionId: 'runtime-1' } }
     )
 
     await waitFor(() => expect(result.current.breakdown).toEqual(breakdown))
 
-    // Switching sessions must drop the numbers immediately — painting them
-    // under the new session's name would be a lie until its own fetch lands.
     requestGateway.mockImplementation(() => new Promise(() => undefined))
     rerender({ sessionId: 'runtime-2' })
 
@@ -86,14 +159,17 @@ describe('useContextBreakdown', () => {
   })
 
   it('reports the measured occupancy the backend sends, not just the estimate', async () => {
-    // `context_used` on the payload is already the measured figure once a turn
-    // has run — the estimate is the backend's own fallback, not a second value
-    // the client has to choose between.
     const measured: ContextBreakdown = { ...breakdown, context_used: 12_000 }
     const requestGateway = vi.fn().mockResolvedValue(measured)
 
     const { result } = renderHook(() =>
-      useContextBreakdown({ busy: false, enabled: true, requestGateway, sessionId: 'runtime-1' })
+      useContextBreakdown({
+        busy: false,
+        enabled: true,
+        requestGateway,
+        sessionId: 'runtime-1',
+        turnEpoch: 0
+      })
     )
 
     await waitFor(() => expect(result.current.breakdown?.context_used).toBe(12_000))

@@ -44,6 +44,9 @@ export function createClientSessionState(
     needsInput: false,
     turnStartedAt: null,
     turnLive: false,
+    contextTurnEpoch: 0,
+    contextUsage: null,
+    contextUsageEpoch: null,
     usage: null
   }
 }

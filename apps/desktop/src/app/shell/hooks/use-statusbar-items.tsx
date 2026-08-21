@@ -12,6 +12,7 @@ import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/st
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
+import { resolveContextGaugeUsage } from '@/lib/context-usage-source'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
@@ -143,6 +144,9 @@ export function useStatusbarItems({
   // reports new usage — far rarer than a delta — so its reference is a valid
   // bail-out key on its own.
   const focusedUsage = useStoreSelector($focusedSessionState, state => state?.usage ?? null)
+  const focusedContextTurnEpoch = useStoreSelector($focusedSessionState, state => state?.contextTurnEpoch ?? 0)
+  const focusedContextUsage = useStoreSelector($focusedSessionState, state => state?.contextUsage ?? null)
+  const focusedContextUsageEpoch = useStoreSelector($focusedSessionState, state => state?.contextUsageEpoch ?? null)
   const focusedStateCwd = useStoreSelector($focusedSessionState, state => state?.cwd?.trim() || '')
 
   // Runtime slices carry the stored id they were bound for. During a primary
@@ -237,32 +241,54 @@ export function useStatusbarItems({
   // toggled off, so this covers the rest.
   const contextItemHidden = useStore($statusbarHiddenIds).includes('context-usage')
 
-  const { breakdown: contextBreakdown, loading: contextBreakdownLoading } = useContextBreakdown({
+  const {
+    breakdown: contextBreakdown,
+    breakdownEpoch: contextBreakdownEpoch,
+    loading: contextBreakdownLoading
+  } = useContextBreakdown({
     busy,
     enabled: !contextItemHidden,
     requestGateway,
-    sessionId: activeSessionId
+    sessionId: activeSessionId,
+    turnEpoch: focusedContextTurnEpoch
   })
 
-  // The breakdown wins whenever we have one, for two reasons: it reports the
-  // MEASURED occupancy once the backend has it (falling back to the estimate
-  // only before that), and it is keyed to the session it describes. The global
-  // `$currentUsage` is neither — a resumed session reports no context fields,
-  // and the store merges rather than replaces, so the PREVIOUS session's gauge
-  // numbers survive the switch. Mid-turn there's no breakdown by design and
-  // the streamed usage carries the gauge.
+  // Source selection is provenance-based, not `busy`-based. The global usage
+  // atom still supplies cumulative totals, but its context fields are stripped:
+  // it merges updates and can therefore retain another session's occupancy
+  // after a switch. Only the focused session's epoch-stamped live measurement
+  // or its own cached breakdown may paint the gauge.
   const gaugeUsage = useMemo<UsageStats>(
     () =>
-      contextBreakdown
-        ? {
-            ...currentUsage,
-            context_max: contextBreakdown.context_max,
-            context_percent: contextBreakdown.context_percent,
-            context_used: contextBreakdown.context_used
-          }
-        : currentUsage,
-    [contextBreakdown, currentUsage]
+      resolveContextGaugeUsage({
+        baseUsage: currentUsage,
+        busy,
+        contextBreakdown,
+        contextBreakdownEpoch,
+        contextTurnEpoch: focusedContextTurnEpoch,
+        contextUsage: focusedContextUsage,
+        contextUsageEpoch: focusedContextUsageEpoch
+      }),
+    [
+      busy,
+      contextBreakdown,
+      contextBreakdownEpoch,
+      currentUsage,
+      focusedContextTurnEpoch,
+      focusedContextUsage,
+      focusedContextUsageEpoch
+    ]
   )
+
+  const currentLiveContext = focusedContextUsage !== null && focusedContextUsageEpoch === focusedContextTurnEpoch
+
+  // Category slices come only from context_breakdown. Once a newer live frame
+  // has superseded an older breakdown, hiding those stale slices is more honest
+  // than pairing current header numbers with prior-turn category proportions.
+  const panelBreakdown =
+    contextBreakdown && (contextBreakdownEpoch === focusedContextTurnEpoch || !currentLiveContext)
+      ? contextBreakdown
+      : null
 
   const contextUsage = useMemo(() => usageContextLabel(gaugeUsage), [gaugeUsage])
   const contextBar = useMemo(() => contextBarLabel(gaugeUsage), [gaugeUsage])
@@ -550,7 +576,7 @@ export function useStatusbarItems({
         menuAlign: 'end',
         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
         menuContent: (
-          <ContextUsagePanel breakdown={contextBreakdown} loading={contextBreakdownLoading} usage={gaugeUsage} />
+          <ContextUsagePanel breakdown={panelBreakdown} loading={contextBreakdownLoading} usage={gaugeUsage} />
         ),
         toggleLabel: copy.toggleContextUsage,
         variant: 'menu'
@@ -592,6 +618,7 @@ export function useStatusbarItems({
       contextBreakdown,
       contextBreakdownLoading,
       contextUsage,
+      panelBreakdown,
       copy,
       gaugeUsage,
       sessionStartedAt,

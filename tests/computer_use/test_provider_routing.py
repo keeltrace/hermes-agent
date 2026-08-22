@@ -115,6 +115,17 @@ class TestRegistry:
         assert get_provider("race") is third
         restore_registration("race", third, None)
 
+    def test_scoped_provider_is_not_visible_to_another_profile(self):
+        provider = FakeProvider("profile-only")
+        register_provider(provider, scope="profile-a")
+
+        assert get_provider("profile-only", scope="profile-a") is provider
+        assert get_provider("profile-only", scope="profile-b") is None
+        with pytest.raises(UnknownComputerUseProvider):
+            resolve_provider("profile-only", scope="profile-b")
+
+        restore_registration("profile-only", provider, None, scope="profile-a")
+
 
 class TestSelection:
     def test_the_configured_provider_builds_the_session_backend(self, clean_provider):
@@ -195,6 +206,34 @@ class TestSelection:
 
         cu_tool.reset_backend_for_tests()
         restore_registration("from-config", provider, None)
+
+    def test_provider_replacement_is_visible_without_resetting_config_cache(self, monkeypatch):
+        first = FakeProvider("hot")
+        second = FakeProvider("hot")
+        register_provider(first)
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "hot")
+        cu_tool.reset_backend_for_tests()
+
+        assert cu_tool.active_computer_use_provider() is first
+        register_provider(second)
+        assert cu_tool.active_computer_use_provider() is second
+
+        cu_tool.reset_backend_for_tests()
+        restore_registration("hot", second, None)
+
+    def test_provider_unload_is_visible_on_the_next_resolution(self, monkeypatch):
+        provider = FakeProvider("unload-me")
+        register_provider(provider)
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "unload-me")
+        cu_tool.reset_backend_for_tests()
+
+        assert cu_tool.active_computer_use_provider() is provider
+        restore_registration("unload-me", provider, None)
+
+        with pytest.raises(UnknownComputerUseProvider):
+            cu_tool.active_computer_use_provider()
+
+        cu_tool.reset_backend_for_tests()
 
     def test_an_unreadable_config_still_gets_the_host(self, monkeypatch):
         monkeypatch.delenv("HERMES_COMPUTER_USE_BACKEND", raising=False)

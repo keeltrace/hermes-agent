@@ -50,12 +50,12 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.computer_use_provider import ComputerUseProvider
-from hermes_constants import hermes_home_key
 from agent.computer_use_registry import (
     HOST_PROVIDER_NAME,
     UnknownComputerUseProvider,
     resolve_provider,
 )
+from hermes_constants import hermes_home_key
 from tools.computer_use import host_provider  # noqa: F401 — registers the built-ins
 from tools.computer_use.backend import (
     ActionResult,
@@ -312,10 +312,13 @@ def _config_preauthorized(action: str, args: Dict[str, Any]) -> bool:
 
 
 _provider_lock = threading.Lock()
-# Keyed by profile home, not one slot: under gateway.multiplex_profiles a
-# single process serves several profiles, and computer_use.provider is read
-# from each one's own config.yaml.
-_provider_cache: Dict[str, ComputerUseProvider] = {}
+# Config selection is cached per profile, but provider OBJECTS are resolved
+# live through the scoped registry. Plugin unload/reload/replacement must be
+# visible to the very next dispatch instead of leaving a stale object cached.
+_provider_name_cache: Dict[str, str] = {}
+# Keep every provider object that actually serviced resolution so provider-
+# owned leases still receive best-effort atexit cleanup after a hot replacement.
+_resolved_providers: Dict[int, ComputerUseProvider] = {}
 
 
 def _configured_provider_name() -> str:
@@ -347,27 +350,29 @@ def _configured_provider_name() -> str:
 
 
 def active_computer_use_provider() -> ComputerUseProvider:
-    """The provider servicing this process, resolved once.
+    """The provider servicing the active profile.
 
-    Cached because config cannot change mid-process and this is read on every
-    dispatch and every tool-registration pass. ``reset_backend_for_tests``
-    clears it.
+    The configured NAME is stable for the process and cached per profile.
+    The provider OBJECT is deliberately resolved through the scoped registry
+    on every call so plugin unload/reload/replacement takes effect immediately.
 
     Raises :class:`UnknownComputerUseProvider` when the configured name is not
-    registered — see the registry on why that is not a silent fallback.
+    visible to this profile — see the registry on why that is not a fallback.
     """
     key = hermes_home_key()
 
     with _provider_lock:
-        cached = _provider_cache.get(key)
+        configured = _provider_name_cache.get(key)
+        if configured is None:
+            configured = _configured_provider_name()
+            _provider_name_cache[key] = configured
 
-        if cached is not None:
-            return cached
+    provider = resolve_provider(configured, scope=key)
 
-        provider = resolve_provider(_configured_provider_name())
-        _provider_cache[key] = provider
+    with _provider_lock:
+        _resolved_providers[id(provider)] = provider
 
-        return provider
+    return provider
 
 
 def _get_backend(session_id: str = "") -> ComputerUseBackend:
@@ -528,7 +533,7 @@ def _shutdown_backend_atexit() -> None:
     # outlive the backend objects that drove them. Only a provider we actually
     # resolved can own anything, so this never forces a resolution at exit.
     with _provider_lock:
-        resolved = list(_provider_cache.values())
+        resolved = list(_resolved_providers.values())
 
     for provider in resolved:
         try:
@@ -544,7 +549,8 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
     """Test helper — tear down the cached backend and per-session state."""
     _shutdown_backend_atexit()
     with _provider_lock:
-        _provider_cache.clear()
+        _provider_name_cache.clear()
+        _resolved_providers.clear()
     _AUX_VISION_ROUTE_CACHE.clear()
 
 

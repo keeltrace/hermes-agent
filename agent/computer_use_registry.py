@@ -1,22 +1,9 @@
 """Registry of computer-use providers, and the rule for picking one.
 
-Providers register at import time — the built-in host backend from
-:mod:`tools.computer_use.host_provider`, third-party runtimes from their
-plugin's ``register(ctx)`` via
-:meth:`hermes_cli.plugins.PluginContext.register_computer_use_provider`.
-:func:`resolve_provider` then answers which one services a call, from the
-``computer_use.provider`` key in ``config.yaml``.
-
-Selection is explicit, never inferred. computer_use has no history of
-auto-detected cloud backends to preserve, and guessing here would silently
-move where the agent's clicks land — so an unset key means the host backend
-and nothing else auto-activates.
-
-A configured name that nobody registered raises rather than falling back.
-Quietly reverting to the host backend would drive the user's own desktop when
-they had asked for a container, which is the one outcome worth crashing over;
-:func:`tools.computer_use.tool.handle_computer_use` turns it into a message
-naming the missing provider.
+Built-in providers are global. Plugin providers are scoped to the active
+Hermes profile, matching the browser/web provider registries. Resolution is
+explicit and fail-closed: an unknown configured provider never falls back to
+driving the gateway host's desktop.
 """
 
 from __future__ import annotations
@@ -26,17 +13,15 @@ import threading
 from typing import Dict, List, Optional
 
 from agent.computer_use_provider import ComputerUseProvider
+from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
 
-#: The built-in provider: cua-driver spawned on whatever host runs the gateway.
 HOST_PROVIDER_NAME = "local"
-
-#: Names users and older configs already use for the built-in backend. Unset
-#: lands here too, so the default is the behavior that predates the registry.
 _HOST_ALIASES = {"", "local", "cua", "cua-driver", "builtin", "host"}
 
 _providers: Dict[str, ComputerUseProvider] = {}
+_scoped_providers: Dict[str, Dict[str, ComputerUseProvider]] = {}
 _lock = threading.Lock()
 
 
@@ -54,86 +39,104 @@ class UnknownComputerUseProvider(LookupError):
         )
 
 
-def register_provider(provider: ComputerUseProvider) -> None:
-    """Register a provider. Re-registering the same name replaces it."""
+def register_provider(
+    provider: ComputerUseProvider, *, scope: Optional[str] = None
+) -> None:
+    """Register a provider globally or for one Hermes profile."""
     if not isinstance(provider, ComputerUseProvider):
         raise TypeError(
             "register_provider() expects a ComputerUseProvider instance, "
             f"got {type(provider).__name__}"
         )
 
-    name = provider.name
-
-    if not isinstance(name, str) or not name.strip():
+    raw_name = provider.name
+    if not isinstance(raw_name, str) or not raw_name.strip():
         raise ValueError("Computer use provider .name must be a non-empty string")
+    name = raw_name.strip()
 
     with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+        target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
+        existing = target.get(name)
+        target[name] = provider
 
     if existing is not None:
         logger.debug("Computer use provider %r replaced %s", name, type(existing).__name__)
 
 
-def list_providers() -> List[ComputerUseProvider]:
-    """Every registered provider, sorted by name."""
+def list_providers(*, scope: Optional[str] = None) -> List[ComputerUseProvider]:
+    """Every provider visible to one profile, sorted by name."""
+    active_scope = scope or hermes_home_key()
     with _lock:
-        return sorted(_providers.values(), key=lambda p: p.name)
+        merged = dict(_providers)
+        merged.update(_scoped_providers.get(active_scope, {}))
+        providers = list(merged.values())
+    return sorted(providers, key=lambda p: p.name)
 
 
-def get_provider(name: str) -> Optional[ComputerUseProvider]:
-    """The provider registered under *name*, or None."""
+def get_provider(
+    name: str, *, scope: Optional[str] = None
+) -> Optional[ComputerUseProvider]:
+    """The provider visible under *name* for one profile, or None."""
     if not isinstance(name, str):
         return None
 
+    key = name.strip()
+    active_scope = scope or hermes_home_key()
     with _lock:
-        return _providers.get(name.strip())
+        return _scoped_providers.get(active_scope, {}).get(key) or _providers.get(key)
 
 
-def snapshot_registration(name: str) -> Optional[ComputerUseProvider]:
-    """What is registered under *name* right now, for unload restore."""
-    return get_provider(name)
+def snapshot_registration(
+    name: str, *, scope: Optional[str] = None
+) -> Optional[ComputerUseProvider]:
+    """Exact registration in one slot, for plugin unload restore."""
+    key = name.strip()
+    with _lock:
+        target = _providers if scope is None else _scoped_providers.get(scope, {})
+        return target.get(key)
 
 
 def restore_registration(
     name: str,
     current: ComputerUseProvider,
     previous: Optional[ComputerUseProvider],
-) -> None:
-    """Undo one registration when its plugin unloads.
-
-    A no-op unless *current* is still the live entry: a third plugin that
-    registered the same name afterwards owns it now, and rolling back to our
-    predecessor would silently take its provider away.
-    """
+    *,
+    scope: Optional[str] = None,
+) -> bool:
+    """Undo one registration only when *current* still owns that exact slot."""
+    key = name.strip()
     with _lock:
-        if _providers.get(name) is not current:
-            return
+        target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
+        if target.get(key) is not current:
+            return False
 
         if previous is None:
-            _providers.pop(name, None)
+            target.pop(key, None)
         else:
-            _providers[name] = previous
+            target[key] = previous
+
+        if scope is not None and not target:
+            _scoped_providers.pop(scope, None)
+
+    return True
 
 
-def resolve_provider(configured: Optional[str]) -> ComputerUseProvider:
-    """Return the provider that should service calls.
+def resolve_provider(
+    configured: Optional[str], *, scope: Optional[str] = None
+) -> ComputerUseProvider:
+    """Return the provider visible to the active profile.
 
-    Raises :class:`UnknownComputerUseProvider` when *configured* names one
-    that is not registered — including the host provider, whose absence means
-    ``tools.computer_use`` was never imported and the caller has a real
-    layering bug rather than a typo.
+    Unknown names raise instead of falling back to the host provider.
     """
     name = (configured or "").strip().lower()
-
     if name in _HOST_ALIASES:
         name = HOST_PROVIDER_NAME
 
-    provider = get_provider(name)
-
+    provider = get_provider(name, scope=scope)
     if provider is None:
-        raise UnknownComputerUseProvider(name, [p.name for p in list_providers()])
-
+        raise UnknownComputerUseProvider(
+            name, [p.name for p in list_providers(scope=scope)]
+        )
     return provider
 
 
@@ -141,3 +144,4 @@ def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
     with _lock:
         _providers.clear()
+        _scoped_providers.clear()

@@ -2595,9 +2595,9 @@ class PluginContext:
         This is how a runtime that owns its own display — a container pool, a
         leased cloud sandbox, a bridge back to the desktop client — supplies
         one without core knowing it exists. Mirrors
-        :meth:`register_browser_provider`, minus per-profile registration
-        scoping: resolution is already per-profile, so a provider a profile
-        never configures is never built.
+        :meth:`register_browser_provider`, including per-profile registration
+        scoping so a plugin enabled for one multiplexed profile is not visible
+        to another profile that never loaded it.
         """
         from agent.computer_use_provider import ComputerUseProvider
         from agent.computer_use_registry import (
@@ -2615,16 +2615,20 @@ class PluginContext:
             return None
 
         registry_name = provider.name.strip()
-        previous = snapshot_registration(registry_name)
-        _register_cu_provider(provider)
+        scope = self._manager.scope_key
+        previous = snapshot_registration(registry_name, scope=scope)
+        _register_cu_provider(provider, scope=scope)
+        registered = snapshot_registration(registry_name, scope=scope)
+        if registered is not provider:
+            return None
         handle = self._track_replacement(
             "computer_use_provider",
             registry_name,
-            slot=("computer_use_provider", registry_name),
+            slot=("computer_use_provider", scope, registry_name),
             current=provider,
             previous=previous,
             restore=lambda replacement: restore_registration(
-                registry_name, provider, replacement
+                registry_name, provider, replacement, scope=scope
             ),
         )
         logger.info(

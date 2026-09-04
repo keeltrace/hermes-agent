@@ -43,8 +43,8 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_non_dispatcher_owned_context", default=False
 )
-_DISPATCHER_AUTHORITY: ContextVar[bool] = ContextVar(
-    "hermes_dispatcher_owned_authority", default=False
+_DISPATCHER_AUTHORITY: ContextVar[tuple[str, str] | None] = ContextVar(
+    "hermes_dispatcher_owned_authority", default=None
 )
 _NON_DISPATCHER_VETO: ContextVar[bool] = ContextVar(
     "hermes_non_dispatcher_veto", default=False
@@ -116,22 +116,44 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
-def has_dispatcher_owned_authority() -> bool:
-    """Whether the current execution may consume the worker runtime.
+def has_dispatcher_owned_authority(
+    *,
+    task_id: str | None = None,
+    workspace: str | None = None,
+) -> bool:
+    """Whether this execution owns the exact requested worker runtime.
 
-    Positive authority is established only by a successful one-shot bootstrap.
-    A cron/non-dispatcher scope or explicit veto dominates at every delegation
-    depth.
+    Positive authority is established only by a successful one-shot bootstrap
+    and is bound to the bootstrapped task/workspace identity. A cron or explicit
+    non-dispatcher veto dominates at every delegation depth.
     """
     if _NON_DISPATCHER_OWNED_CONTEXT.get() or _NON_DISPATCHER_VETO.get():
         return False
-    return bool(_DISPATCHER_AUTHORITY.get())
+    authority = _DISPATCHER_AUTHORITY.get()
+    if not authority:
+        return False
+    authority_task, authority_workspace = authority
+    if task_id is not None and authority_task != str(task_id).strip():
+        return False
+    if (
+        workspace is not None
+        and authority_workspace != str(workspace).strip()
+    ):
+        return False
+    return True
 
 
 def is_dispatcher_owned_worker_context() -> bool:
-    """Whether this is the root worker, not merely an authorized delegate."""
+    """Whether this is the root worker for the exact ambient task identity."""
+    task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    workspace = os.getenv("HERMES_KANBAN_WORKSPACE", "").strip()
     return bool(
-        has_dispatcher_owned_authority()
+        task_id
+        and workspace
+        and has_dispatcher_owned_authority(
+            task_id=task_id,
+            workspace=workspace,
+        )
         and not _DELEGATED_CHILD_CONTEXT.get()
     )
 
@@ -149,16 +171,17 @@ def bootstrap_dispatcher_authority(
     task_id: str,
     workspace: str | None = None,
     environ: MutableMapping[str, str] | None = None,
-) -> Token[bool]:
-    """Consume the one-shot worker marker and establish process-local authority."""
+) -> Token[tuple[str, str] | None]:
+    """Consume the one-shot marker and bind authority to task/workspace."""
     env = environ if environ is not None else os.environ
     marker_raw = str(env.get(DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV, "")).strip()
     kanban_task = str(env.get("HERMES_KANBAN_TASK", "")).strip()
+    env_workspace = str(env.get("HERMES_KANBAN_WORKSPACE", "")).strip()
     source = str(env.get("HERMES_SESSION_SOURCE", "")).strip().lower()
 
     def deny(reason: str) -> None:
         env.pop(DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV, None)
-        _DISPATCHER_AUTHORITY.set(False)
+        _DISPATCHER_AUTHORITY.set(None)
         raise DispatcherAuthorityError(
             f"dispatcher ownership bootstrap denied: {reason}"
         )
@@ -187,10 +210,12 @@ def bootstrap_dispatcher_authority(
         deny("ownership marker does not match this task runtime")
 
     env.pop(DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV, None)
-    return _DISPATCHER_AUTHORITY.set(True)
+    return _DISPATCHER_AUTHORITY.set((expected_task, env_workspace))
 
 
-def exit_dispatcher_authority(token: Token[bool]) -> None:
+def exit_dispatcher_authority(
+    token: Token[tuple[str, str] | None],
+) -> None:
     _DISPATCHER_AUTHORITY.reset(token)
 
 

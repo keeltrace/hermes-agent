@@ -41,7 +41,7 @@ def _clear_kanban_detect_cache():
     from agent import delegation_context as dc
     import agent.skill_utils as su
 
-    authority = dc._DISPATCHER_AUTHORITY.set(False)
+    authority = dc._DISPATCHER_AUTHORITY.set(None)
     delegated = dc._DELEGATED_CHILD_CONTEXT.set(False)
     non_dispatcher = dc._NON_DISPATCHER_OWNED_CONTEXT.set(False)
     veto = dc._NON_DISPATCHER_VETO.set(False)

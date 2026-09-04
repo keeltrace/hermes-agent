@@ -54,7 +54,7 @@ def _isolated_dispatcher_authority():
     """Keep positive dispatcher authority test-local (ContextVar hygiene)."""
     from agent import delegation_context as dc
 
-    token = dc._DISPATCHER_AUTHORITY.set(False)
+    token = dc._DISPATCHER_AUTHORITY.set(None)
     veto_token = dc._NON_DISPATCHER_VETO.set(False)
     yield
     dc._DISPATCHER_AUTHORITY.reset(token)
@@ -110,34 +110,30 @@ def test_runtime_mount_overrides_profile_docker_volumes(monkeypatch, tmp_path):
 def test_preterminal_file_tool_relative_path_uses_runtime_workspace(
     monkeypatch, tmp_path
 ):
-    from tools import file_tools
-    from tools import file_tools_paths
+    from tools import file_tools, terminal_tool
 
     ws = tmp_path / "project" / "task"
     ws.mkdir(parents=True)
     _pin_kanban_worker(monkeypatch, ws, task_id="t_file_path")
     # This is the host-form value the dispatcher exports. Before the first
     # terminal call it must not win over the runtime's container cwd.
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
     monkeypatch.setenv("TERMINAL_CWD", str(ws.resolve()))
-    monkeypatch.setattr(
-        file_tools_paths, "_terminal_env_type_for_task", lambda _task: "docker"
-    )
 
     resolved = file_tools._resolve_path_for_task("canary.txt", "default")
     assert str(resolved) == "/workspace/canary.txt"
 
 
 def test_preterminal_local_worker_keeps_host_workspace_path(monkeypatch, tmp_path):
-    from tools import file_tools
-    from tools import file_tools_paths
+    from tools import file_tools, terminal_tool
 
     ws = tmp_path / "project" / "task"
     ws.mkdir(parents=True)
     _pin_kanban_worker(monkeypatch, ws, task_id="t_local_file_path")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
     monkeypatch.setenv("TERMINAL_CWD", str(ws.resolve()))
-    monkeypatch.setattr(
-        file_tools_paths, "_terminal_env_type_for_task", lambda _task: "local"
-    )
 
     resolved = file_tools._resolve_path_for_task("canary.txt", "default")
     assert resolved == (ws / "canary.txt").resolve()
@@ -149,6 +145,8 @@ def test_runtime_gets_unique_container_key(monkeypatch, tmp_path):
     ws = tmp_path / "task"
     ws.mkdir()
     _pin_kanban_worker(monkeypatch, ws, task_id="t_unique")
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", True)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
     assert terminal_tool._resolve_container_task_id(None) == physical_task_key("t_unique")
     assert terminal_tool._resolve_container_task_id("arbitrary-session") == physical_task_key("t_unique")
     # P1-D: the physical key is portable-safe even for logical ids containing ':'.
@@ -164,6 +162,7 @@ def test_runtime_gets_unique_container_key(monkeypatch, tmp_path):
         KANBAN_TERMINAL_RUNTIME_ENV,
         encode_kanban_terminal_runtime(runtime_unsafe),
     )
+    _grant_worker_authority(monkeypatch, unsafe, ws.resolve())
     key = terminal_tool._resolve_container_task_id(None)
     assert ":" not in key
     assert key == physical_task_key(unsafe)

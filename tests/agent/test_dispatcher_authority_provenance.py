@@ -19,7 +19,7 @@ from agent import delegation_context as dc
 
 @pytest.fixture(autouse=True)
 def _isolated_authority():
-    token = dc._DISPATCHER_AUTHORITY.set(False)
+    token = dc._DISPATCHER_AUTHORITY.set(None)
     delegated = dc._DELEGATED_CHILD_CONTEXT.set(False)
     non_disp = dc._NON_DISPATCHER_OWNED_CONTEXT.set(False)
     veto = dc._NON_DISPATCHER_VETO.set(False)
@@ -49,6 +49,23 @@ def test_dispatcher_worker_allowed():
     # one-shot: the marker is consumed from the process environment
     assert dc.DISPATCHER_OWNERSHIP_BOOTSTRAP_ENV not in env
     dc.exit_dispatcher_authority(tok)
+
+
+def test_authority_is_bound_to_bootstrapped_task_and_workspace():
+    env = _worker_env("t_bound")
+    tok = dc.bootstrap_dispatcher_authority(task_id="t_bound", environ=env)
+    try:
+        assert dc.has_dispatcher_owned_authority(
+            task_id="t_bound", workspace="/tmp/ws"
+        )
+        assert not dc.has_dispatcher_owned_authority(
+            task_id="t_other", workspace="/tmp/ws"
+        )
+        assert not dc.has_dispatcher_owned_authority(
+            task_id="t_bound", workspace="/tmp/other"
+        )
+    finally:
+        dc.exit_dispatcher_authority(tok)
 
 
 def test_delegate_of_worker_allowed():

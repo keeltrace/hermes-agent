@@ -102,8 +102,9 @@ def test_local_context_with_stale_path_map_does_not_translate(tmp_path):
              "read_only": False, "purpose": "workspace"}
         ],
     }
-    stale_map = [{"local_root": str(tmp_path / "unrelated"), "host_root": "/elsewhere"}]
-    (tmp_path / "unrelated").mkdir()
+    # This deliberately COVERS the source. A stale map must still be ignored
+    # because the selected daemon is local.
+    stale_map = [{"local_root": str(tmp_path), "host_root": "/elsewhere"}]
     mounts = translate_runtime_mounts(
         runtime, path_map=stale_map,
         docker_host="unix:///var/run/docker.sock",
@@ -171,7 +172,13 @@ def test_frozen_selector_pins_lifecycle_argv(monkeypatch, tmp_path):
             result.stdout = "bridge\n"
         return result
 
-    monkeypatch.setattr("subprocess.run", recording_run)
+    monkeypatch.setattr(
+        "tools.environments.docker.find_docker", lambda: "/usr/bin/docker"
+    )
+    monkeypatch.setattr(
+        "tools.environments.docker.run_capture", recording_run
+    )
+    monkeypatch.setattr(DockerEnvironment, "init_session", lambda self: None)
 
     sel = _selector()
     DockerEnvironment(

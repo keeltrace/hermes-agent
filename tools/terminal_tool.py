@@ -145,11 +145,20 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _kanban_runtime_context_allowed() -> bool:
-    """Whether this execution has positive dispatcher-owned runtime authority."""
+    """Whether this execution owns the exact ambient task runtime identity."""
     try:
         from agent.delegation_context import has_dispatcher_owned_authority
 
-        return bool(has_dispatcher_owned_authority())
+        task_id = os.getenv("HERMES_KANBAN_TASK", "").strip()
+        workspace = os.getenv("HERMES_KANBAN_WORKSPACE", "").strip()
+        if not task_id or not workspace:
+            return False
+        return bool(
+            has_dispatcher_owned_authority(
+                task_id=task_id,
+                workspace=workspace,
+            )
+        )
     except Exception:
         # A provenance probe failure must never restore ambient env authority.
         return False
@@ -208,7 +217,14 @@ def _load_kanban_runtime(
 
 
 def _active_kanban_runtime_container_key() -> str | None:
-    """Portable physical key for an authorized task runtime, when active."""
+    """Portable physical key for an authorized Docker task runtime."""
+    # Some entry paths rely on config.yaml bridging rather than a launcher-set
+    # TERMINAL_ENV. Resolve that bridge before deciding whether the runtime is
+    # Docker-scoped, or a valid worker can collapse onto the shared default key.
+    _ensure_terminal_env_bridged()
+    if _tenv("TERMINAL_ENV", "local").strip().lower() != "docker":
+        return None
+
     from hermes_cli.kanban_runtime import (
         KANBAN_TERMINAL_RUNTIME_ENV,
         decode_kanban_terminal_runtime,

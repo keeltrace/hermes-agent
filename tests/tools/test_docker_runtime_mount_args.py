@@ -43,6 +43,51 @@ def test_runtime_mount_args_reject_duplicate_targets():
 
 
 @pytest.mark.parametrize(
+    "runtime_mounts",
+    [
+        [
+            {
+                "source": "/host/task",
+                "target": "/workspace",
+                "read_only": True,
+                "purpose": "workspace",
+            }
+        ],
+        [
+            {
+                "source": "/host/task",
+                "target": "/other",
+                "read_only": False,
+                "purpose": "workspace",
+            }
+        ],
+        [
+            {
+                "source": "/host/task",
+                "target": "/workspace",
+                "read_only": False,
+                "purpose": "untrusted-extra",
+            }
+        ],
+    ],
+)
+def test_invalid_runtime_shape_fails_before_any_docker_call(
+    monkeypatch, runtime_mounts
+):
+    def must_not_reach_docker(*_args, **_kwargs):
+        pytest.fail("invalid runtime shape must fail before a Docker probe")
+
+    monkeypatch.setattr(
+        docker_env, "_ensure_docker_available", must_not_reach_docker
+    )
+    with pytest.raises(ValueError):
+        docker_env.DockerEnvironment(
+            image="python:3.11",
+            runtime_mounts=runtime_mounts,
+        )
+
+
+@pytest.mark.parametrize(
     "extra_args",
     [
         ["--mount", "type=bind,src=/opt/data,dst=/host-data"],

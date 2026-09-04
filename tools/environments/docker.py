@@ -625,6 +625,31 @@ class DockerEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout)
         self._runtime_mounts = _normalize_runtime_mounts(runtime_mounts)
         runtime_scoped = bool(self._runtime_mounts)
+        if runtime_scoped:
+            unsupported = [
+                mount["purpose"]
+                for mount in self._runtime_mounts
+                if mount["purpose"] not in {"workspace", "git-common-dir"}
+            ]
+            if unsupported:
+                raise ValueError(
+                    "task-scoped Docker runtime has unsupported mount purposes: "
+                    f"{unsupported!r}"
+                )
+            workspace_mounts = [
+                mount
+                for mount in self._runtime_mounts
+                if mount["target"] == "/workspace"
+            ]
+            if (
+                len(workspace_mounts) != 1
+                or workspace_mounts[0]["purpose"] != "workspace"
+                or workspace_mounts[0]["read_only"]
+            ):
+                raise ValueError(
+                    "task-scoped Docker runtime requires exactly one read-write "
+                    "workspace mount at /workspace"
+                )
         self._persistent = persistent_filesystem
         self._persist_across_processes = (
             bool(persist_across_processes) and not runtime_scoped

@@ -466,6 +466,11 @@ def translate_host_path(
     silently creating an empty bind source on the remote host.
     """
     src = _canonical_existing_dir(source, label="runtime mount source")
+    if not is_remote_docker_host(docker_host):
+        # Path maps describe a different daemon host. Never apply a stale map
+        # to the local/default daemon, even when its local_root matches.
+        return str(src)
+
     mappings = [_normalize_path_map_entry(entry) for entry in (path_map or [])]
     mappings.sort(key=lambda pair: len(str(pair[0])), reverse=True)
 
@@ -477,12 +482,10 @@ def translate_host_path(
         translated = host_root / rel
         return str(translated)
 
-    if is_remote_docker_host(docker_host):
-        raise KanbanRuntimeError(
-            f"Docker daemon {docker_host!r} is remote but no docker_host_path_map "
-            f"entry covers {src}; refusing an unverified bind mount"
-        )
-    return str(src)
+    raise KanbanRuntimeError(
+        f"Docker daemon {docker_host!r} is remote but no docker_host_path_map "
+        f"entry covers {src}; refusing an unverified bind mount"
+    )
 
 
 def _path_within_authority(path: Path, roots: Iterable[Path]) -> bool:

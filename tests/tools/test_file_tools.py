@@ -1055,3 +1055,30 @@ class TestSSHConfigWriteGateSingleQuery:
             f"required kwargs {missing}; it would raise TypeError instead "
             f"of showing an approval prompt"
         )
+
+
+def test_token_economy_caps_read_file_character_budget(monkeypatch):
+    import tools.file_tools as ft
+    monkeypatch.setattr(ft, "_max_read_chars_cached", None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"token_economy": {"enabled": True, "live_tool_result_chars": 12000}},
+    )
+    assert ft._get_max_read_chars() == 12000
+
+
+def test_explicit_smaller_read_cap_wins_inside_token_economy(monkeypatch):
+    import tools.file_tools as ft
+    monkeypatch.setattr(ft, "_max_read_chars_cached", None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"file_read_max_chars": 6000, "token_economy": {"enabled": True, "live_tool_result_chars": 12000}},
+    )
+    assert ft._get_max_read_chars() == 6000
+
+
+def test_disabling_token_economy_restores_stock_read_cap(monkeypatch):
+    import tools.file_tools as ft
+    monkeypatch.setattr(ft, "_max_read_chars_cached", None)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"token_economy": {"enabled": False}})
+    assert ft._get_max_read_chars() == 100000

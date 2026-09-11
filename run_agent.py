@@ -402,6 +402,15 @@ class AIAgent(
         # /new, /resume or /branch on the same agent must re-snapshot at its own session start.
         self._frozen_workspace_snapshot = None
 
+        # Token-economy provider projections are session-scoped. In particular,
+        # compressed task-state text is pinned for cache stability within one
+        # summary epoch and must never leak across /new, /resume, or /branch.
+        self._token_economy_pending_request_id = None
+        self._token_economy_compaction_saved_tokens = 0
+        self._token_economy_compaction_reason = ""
+        self._token_economy_task_projection_epoch = ""
+        self._token_economy_task_projection_text = ""
+
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
         # Who wrote the current turn. build_turn_context() sets it at the start of every turn.
@@ -899,8 +908,17 @@ class AIAgent(
             if turn_author is not None:
                 sync_kwargs["turn_author"] = turn_author
             self._memory_manager.sync_all(user_text, response_text, **sync_kwargs)
-            # Sibling of the build_turn_context() prefetch gate: don't key recall on zero-signal prompts.
-            if not is_trivial_prompt(user_text):
+            # Keep durable writes, but do not spend background recall work when token-economy
+            # has disabled automatic memory projection. Memory remains available through its tool.
+            queue_prefetch = True
+            try:
+                from agent.token_economy import load_settings as _load_token_economy_settings
+                _te = _load_token_economy_settings()
+                if _te.enabled and not _te.memory_prompt_injection:
+                    queue_prefetch = False
+            except Exception:
+                pass
+            if queue_prefetch and not is_trivial_prompt(user_text):
                 self._memory_manager.queue_prefetch_all(user_text, session_id=self.session_id or "")
         except Exception:
             pass

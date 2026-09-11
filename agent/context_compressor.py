@@ -1822,7 +1822,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     @property
     def tail_token_budget(self) -> int:
         if self._tail_token_budget is None:
-            if getattr(self, "tail_mode", "lean") == "lean":
+            runtime_override = getattr(self, "_runtime_tail_token_budget_override", None)
+            if isinstance(runtime_override, int) and runtime_override > 0:
+                self._tail_token_budget = min(runtime_override, max(1, self.threshold_tokens - 1))
+            elif getattr(self, "tail_mode", "lean") == "lean":
                 # Lean mode: tail is a small clamped recency window; the summary carries continuity.
                 self._tail_token_budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(self.context_length * 0.025)))
             else:
@@ -1836,12 +1839,19 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     @property
     def max_summary_tokens(self) -> int:
         if self._max_summary_tokens is None:
-            self._max_summary_tokens = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+            value = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+            runtime_override = getattr(self, "_runtime_max_summary_tokens_override", None)
+            if isinstance(runtime_override, int) and runtime_override > 0:
+                value = min(value, runtime_override)
+            self._max_summary_tokens = max(1, value)
         return self._max_summary_tokens
 
     @max_summary_tokens.setter
     def max_summary_tokens(self, value: int) -> None:
-        self._max_summary_tokens = value
+        runtime_override = getattr(self, "_runtime_max_summary_tokens_override", None)
+        if isinstance(runtime_override, int) and runtime_override > 0:
+            value = min(int(value), runtime_override)
+        self._max_summary_tokens = max(1, int(value))
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear all per-session compaction state at a real session boundary.
@@ -2928,10 +2938,21 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         return pruned_msgs, pruned_count
 
     def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
-        """Scale the summary token budget with content size and context window."""
+        """Scale the summary token budget with content size and context window.
+
+        A runtime floor override lets token-economy profiles avoid the stock 2K
+        minimum summary when the entire working-set ceiling is only 8K. Stock
+        compressors have no override and preserve the historical behavior.
+        """
         content_tokens = estimate_messages_tokens_rough(turns_to_summarize)
         budget = int(content_tokens * _SUMMARY_RATIO)
-        return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
+        minimum = getattr(self, "_runtime_min_summary_tokens_override", _MIN_SUMMARY_TOKENS)
+        try:
+            minimum = max(1, int(minimum))
+        except (TypeError, ValueError):
+            minimum = _MIN_SUMMARY_TOKENS
+        minimum = min(minimum, self.max_summary_tokens)
+        return max(minimum, min(budget, self.max_summary_tokens))
 
     # Summarizer-input limits: the budget is the summary model's window, not the main model's.
     _CONTENT_MAX = 6000       # total chars per message body

@@ -610,10 +610,17 @@ def finalize_turn(
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
+    _automatic_review_allowed = True
+    try:
+        from agent.token_economy import automatic_background_review_allowed
+        _automatic_review_allowed = automatic_background_review_allowed()
+    except Exception:
+        pass
     if (
         final_response
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
+        and _automatic_review_allowed
         and (_should_review_memory or _should_review_skills)
     ):
         with suppress(Exception):
@@ -637,6 +644,14 @@ def finalize_turn(
             model=agent.model,
             platform=_platform,
         )
+
+    try:
+        from agent.token_economy import finalize_no_usage, note_turn_finalized
+        if getattr(agent, "_token_economy_pending_request_id", None):
+            finalize_no_usage(agent, status="turn_failed_no_response" if failed else "turn_ended_no_usage")
+        note_turn_finalized(agent, failed=bool(failed), interrupted=bool(interrupted), exit_reason=_turn_exit_reason)
+    except Exception:
+        logger.debug("token-economy turn-final checkpoint failed", exc_info=True)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

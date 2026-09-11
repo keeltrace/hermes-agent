@@ -54,11 +54,20 @@ def _get_max_read_chars() -> int:
     if _max_read_chars_cached is None:
         try:
             from hermes_cli.config import load_config
-            val = load_config().get("file_read_max_chars")
+            cfg = load_config() or {}
+            val = cfg.get("file_read_max_chars")
+            valid = isinstance(val, (int, float)) and val > 0
+            resolved = int(val) if valid else _DEFAULT_MAX_READ_CHARS
+            te = cfg.get("token_economy") if isinstance(cfg, dict) else None
+            if isinstance(te, dict):
+                enabled = te.get("enabled", False)
+                enabled = enabled if isinstance(enabled, bool) else str(enabled).strip().lower() in {"1", "true", "yes", "on"}
+                raw_cap = te.get("live_tool_result_chars", 12000)
+                if enabled and isinstance(raw_cap, (int, float)) and raw_cap > 0:
+                    resolved = min(resolved, max(4000, int(raw_cap)))
+            _max_read_chars_cached = resolved
         except Exception:
-            val = None
-        valid = isinstance(val, (int, float)) and val > 0
-        _max_read_chars_cached = int(val) if valid else _DEFAULT_MAX_READ_CHARS
+            _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
     return _max_read_chars_cached
 
 
@@ -1027,13 +1036,13 @@ READ_FILE_SCHEMA = {
     # route we trust (_read_file_schema_overrides). Scanned-page coverage
     # teaching lives in the response-time NEEDS-OCR warning
     # (read_extract.py); the schema doesn't pre-teach it.
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB. Cannot read images/binary — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Large reads are truncated on a line boundary at the active character budget and return a next_offset; continue with offset to read the rest. Documents auto-extract to readable text: .ipynb, Office (.docx/.xlsx/.pptx and legacy .doc/.ppt/.xls), PDF (text layer), OpenDocument, RTF, EPUB. Cannot read images/binary — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.", "default": DEFAULT_READ_LIMIT, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped by the active character budget with a next_offset continuation.", "default": DEFAULT_READ_LIMIT, "maximum": 2000}
         },
         "required": ["path"]
     }

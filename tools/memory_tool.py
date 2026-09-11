@@ -220,8 +220,15 @@ def get_builtin_memory_config(config: Optional[Dict[str, Any]] = None) -> Dict[s
 
 
 def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> Tuple[bool, bool]:
-    """Return ``(memory_enabled, user_profile_enabled)`` from resolved config."""
+    """Return ``(memory_enabled, user_profile_enabled)`` from resolved config.
+
+    ``memory.enabled`` is a master compatibility switch. A false value disables
+    both prompt-injected stores so lean/headless profiles cannot accidentally
+    inherit the historical per-store true defaults.
+    """
     section = get_builtin_memory_config(config)
+    if "enabled" in section and not is_truthy_value(section.get("enabled"), default=True):
+        return (False, False)
     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
 
 

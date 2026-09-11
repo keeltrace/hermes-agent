@@ -1194,6 +1194,8 @@ DEFAULT_CONFIG = {
     "memory": {  # Persistent memory — bounded curated memory injected into the system prompt
         "memory_enabled": True,
         "user_profile_enabled": True,
+        # Keep stores/tools available while optionally omitting MEMORY.md/USER.md from every prompt.
+        "inject_context": False,
         # Approval gate for memory writes on BOTH foreground turns and the background review fork.
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
@@ -1786,9 +1788,45 @@ DEFAULT_CONFIG = {
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
     },
-    # Tool Search: deferrable (MCP / non-core plugin) tools are replaced in the model-facing array
-    # by tool_search / tool_describe / tool_call bridges and surfaced on demand. Core Hermes tools
-    # (terminal, file tools, todo, memory, browser_*, ...) are NEVER deferred.
+    # Token-economy rollout flag. Disable this single block to return to the stock
+    # context/tool behavior without deleting sidecar telemetry or archived results.
+    "token_economy": {
+        # Rollout is explicit: the guarded activation script turns this on only
+        # after regression + prompt-budget verification. Merely running this
+        # branch must preserve stock Hermes behavior.
+        "enabled": False,
+        "ledger_enabled": True,
+        # auto -> short for ordinary chat, work in a coding workspace, autonomous for workers.
+        "session_mode": "auto",
+        # Historical textual tool bodies at or above this size are replaced in provider
+        # requests by durable result-id receipts; the canonical transcript is unchanged.
+        "tool_result_externalize_chars": 256,
+        "tool_result_receipt_chars": 160,
+        "retain_tool_result_turns": 1,
+        # Bound the first tool replay too; larger exact results spill/archive and remain recoverable.
+        "live_tool_result_chars": 4000,
+        "live_tool_turn_chars": 8000,
+        "task_state_enabled": True,
+        "task_state_projection_chars": 900,
+        # Collapse duplicated operational prose while token-economy is enabled.
+        # The master token_economy.enabled flag restores stock prompt bytes.
+        "compact_prompt": True,
+        # Keep the instant deterministic session title; skip the background LLM upgrade unless explicitly re-enabled.
+        "llm_title_upgrade": False,
+        # Keep durable memory stores/tools available without paying MEMORY.md/USER.md on every request.
+        "memory_prompt_injection": False,
+        # Context-file prose remains authoritative but is bounded independently of huge nominal model windows.
+        "context_file_max_chars": 4000,
+        # Absolute working-set ceilings; short mode compacts around 8K to remain friendly to low-TPM free providers.
+        "short_context_ceiling": 8000,
+        "work_context_ceiling": 16000,
+        "autonomous_context_ceiling": 24000,
+    },
+
+    # Tool Search: deferrable tools are replaced in the model-facing array by
+    # tool_search / tool_describe / tool_call bridges and surfaced on demand.
+    # Stock mode keeps core Hermes tools direct. Token-economy uses a session-mode
+    # direct waist (short/work/autonomous) and defers other core tools as well.
     "tools": {
         "tool_search": {
             # Tiered: tier 0 (no deferrable tools) = everything eager; tier 1 = bridge + a
@@ -1814,6 +1852,10 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,
+            "compact_direct": False,
+            "compact_bridge": False,
+            # None = curated built-in deferral set; list = exact core tools additionally deferred.
+            "defer": None,
         },
         # Remote connector discovery/lifecycle through the Nous tool gateway.
         # The flag is the user's off switch; availability additionally requires

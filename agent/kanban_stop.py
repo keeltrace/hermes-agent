@@ -6,6 +6,7 @@ Policy-only: return a bounded synthetic nudge so the loop continues instead of e
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -44,6 +45,33 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def successful_kanban_terminal_result(messages: Iterable[dict] | None) -> Optional[str]:
+    """Return a terminal tool name only when its latest result says ``ok: true``.
+
+    The shared board is already terminal after that durable receipt. Requesting a
+    prose follow-up burns another provider call and can turn a completed worker
+    into a misleading rate-limit failure.
+    """
+    if not messages:
+        return None
+    for msg in reversed(list(messages)):
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        name = str(msg.get("name") or "")
+        if name not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        content = msg.get("content")
+        payload = content if isinstance(content, dict) else None
+        if payload is None and isinstance(content, str):
+            try:
+                payload = json.loads(content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+        if isinstance(payload, dict) and payload.get("ok") is True:
+            return name
+    return None
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -76,4 +104,5 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal",
+           "successful_kanban_terminal_result"]

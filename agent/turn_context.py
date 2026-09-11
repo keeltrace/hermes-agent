@@ -772,8 +772,14 @@ def _memory_turn_start_and_prefetch(
             author_is_bot=bool(_author.get("is_bot")),
         )
     ext_prefetch_cache = ""
+    prefetch_enabled = True
     with suppress(Exception):
-        if not is_trivial_prompt(_query):
+        from agent.token_economy import load_settings as _load_token_economy_settings
+        _te = _load_token_economy_settings()
+        if _te.enabled and not _te.memory_prompt_injection:
+            prefetch_enabled = False
+    with suppress(Exception):
+        if prefetch_enabled and not is_trivial_prompt(_query):
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
@@ -936,6 +942,11 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+    try:
+        from agent.token_economy import note_user_turn
+        note_user_turn(agent, original_user_message)
+    except Exception:
+        logger.debug("token-economy user-turn checkpoint failed", exc_info=True)
     should_review_memory = _tick_memory_nudge(agent)
     _emit_reaction(agent, original_user_message)
 

@@ -636,6 +636,34 @@ class CLIInfoMixin:
             return
 
         args = cmd_original.split(maxsplit=1)[1].strip().lower() if " " in cmd_original else ""
+        if args == "waste":
+            from agent.token_economy import context_waste_lines
+            print("\n  ♻️  Context Waste")
+            for line in context_waste_lines(self.agent.session_id or ""):
+                print(f"  {line}")
+            print()
+            return
+        if args == "diff":
+            from agent.token_economy import context_diff_lines
+            print("\n  Δ Context Diff")
+            for line in context_diff_lines(self.agent.session_id or ""):
+                print(f"  {line}")
+            print()
+            return
+        if args.startswith("history"):
+            fields = args.split()
+            limit = 12
+            if len(fields) > 1:
+                try: limit = int(fields[1])
+                except ValueError:
+                    print(f"  Invalid history count: {fields[1]}")
+                    return
+            from agent.token_economy import context_history_lines
+            print("\n  🧾 Context History")
+            for line in context_history_lines(self.agent.session_id or "", limit=limit):
+                print(f"  {line}")
+            print()
+            return
         expanded = args in {"all", "full", "details"}
 
         from agent.context_breakdown import (
@@ -752,6 +780,27 @@ class CLIInfoMixin:
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history (`--days N` / `N`, `--source`)."""
         parts = command.split()
+        if len(parts) > 1 and parts[1].lower() == "waste":
+            days = 30
+            rest = parts[2:]
+            i = 0
+            while i < len(rest):
+                if rest[i] == "--days" and i + 1 < len(rest):
+                    try: days = int(rest[i + 1])
+                    except ValueError:
+                        print(f"  Invalid --days value: {rest[i + 1]}")
+                        return
+                    i += 2
+                elif rest[i].isdigit():
+                    days = int(rest[i]); i += 1
+                else:
+                    i += 1
+            from agent.token_economy import waste_insights_lines
+            print()
+            for line in waste_insights_lines(days):
+                print(f"  {line}")
+            print()
+            return
         days = 30
         source = None
         i = 1

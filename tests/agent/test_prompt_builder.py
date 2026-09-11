@@ -1213,3 +1213,27 @@ class TestContextFileReadTimeout:
 
         with pytest.raises(FileNotFoundError):
             _read_text_with_timeout(tmp_path / "missing.md", timeout=1.0)
+
+
+def test_token_economy_caps_context_files_independent_of_huge_model_window(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"token_economy": {"enabled": True, "context_file_max_chars": 4000}},
+    )
+    assert _get_context_file_max_chars(1_000_000) == 4000
+
+
+def test_token_economy_cap_temporarily_beats_legacy_context_file_cap(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"context_file_max_chars": 12000, "token_economy": {"enabled": True, "context_file_max_chars": 4000}},
+    )
+    assert _get_context_file_max_chars(1_000_000) == 4000
+
+
+def test_master_off_restores_legacy_context_file_cap(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"context_file_max_chars": 12000, "token_economy": {"enabled": False, "context_file_max_chars": 4000}},
+    )
+    assert _get_context_file_max_chars(1_000_000) == 12000

@@ -436,7 +436,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
-            {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 256},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -768,7 +768,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
-        self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
+        self._recall_max_tokens = int(cfg.get("recall_max_tokens", 256))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the

@@ -22,6 +22,8 @@ _HERMES_CORE_TOOLS = [
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
     "todo_list", "memory",
+    # Token-economy recovery/state capabilities. Lean mode defers both behind Tool Search.
+    "tool_result_read", "task_state",
     "session_search",
     "clarify",
     "execute_code", "delegate_task",
@@ -125,6 +127,7 @@ TOOLSETS = {
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    "token_economy": _ts("Recover archived tool results and durable structured task state", ["tool_result_read", "task_state"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),

@@ -89,9 +89,21 @@ def record_response_usage(
             "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
         )
+        try:
+            from agent.token_economy import finalize_no_usage
+            finalize_no_usage(agent)
+        except Exception:
+            logger.debug("token-economy no-usage reconciliation failed", exc_info=True)
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode)
+    # Reconcile the main provider request before MoA advisor usage is folded in: the
+    # Token Ledger row describes this exact payload, not separate advisor fan-out.
+    try:
+        from agent.token_economy import reconcile_response
+        reconcile_response(agent, canonical_usage)
+    except Exception:
+        logger.debug("token-economy provider reconciliation failed", exc_info=True)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage

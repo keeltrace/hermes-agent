@@ -8,6 +8,7 @@ from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    successful_kanban_terminal_result,
 )
 
 
@@ -76,6 +77,26 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 
 
 
+
+
+def test_terminal_success_requires_ok_receipt(clear_kanban_env):
+    messages = [
+        {
+            "role": "tool", "name": "kanban_complete", "tool_call_id": "1",
+            "content": '{"ok": true, "task_id": "t_abc", "run_id": 1}',
+        },
+    ]
+    assert successful_kanban_terminal_result(messages) == "kanban_complete"
+
+
+def test_terminal_failure_does_not_short_circuit(clear_kanban_env):
+    messages = [
+        {
+            "role": "tool", "name": "kanban_block", "tool_call_id": "1",
+            "content": '{"ok": false, "error": "conflict"}',
+        },
+    ]
+    assert successful_kanban_terminal_result(messages) is None
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────

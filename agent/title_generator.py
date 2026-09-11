@@ -7,6 +7,7 @@ and neither replaces a name the user typed."""
 
 import json
 import logging
+import os
 import re
 import threading
 from contextlib import suppress
@@ -106,7 +107,28 @@ def _title_language() -> str:
         return ""
 
 
+def _token_economy_allows_llm_title() -> bool:
+    try:
+        from agent.token_economy import load_settings
+        settings = load_settings()
+        return not settings.enabled or settings.llm_title_upgrade
+    except Exception:
+        return True
+
+
 def _auto_title_enabled() -> bool:
+    if not _token_economy_allows_llm_title():
+        return False
+    if (
+        os.environ.get("HERMES_SESSION_SOURCE") == "kanban"
+        and os.environ.get("HERMES_KANBAN_TASK")
+    ):
+        try:
+            from agent.delegation_context import is_dispatcher_owned_worker_context
+            if is_dispatcher_owned_worker_context():
+                return False
+        except Exception:
+            logger.debug("Could not verify Kanban worker ownership for title suppression", exc_info=True)
     try:
         from utils import is_truthy_value
         return is_truthy_value(_title_config().get("enabled"), default=True)

@@ -52,6 +52,14 @@ class TestConfigParsing:
         assert cfg.enabled == "auto"
 
 
+    def test_compact_direct_defaults_off_and_parses_boolish_values(self):
+        from tools.tool_search import ToolSearchConfig
+        assert ToolSearchConfig.from_raw(None).compact_direct is False
+        assert ToolSearchConfig.from_raw({"compact_direct": True}).compact_direct is True
+        assert ToolSearchConfig.from_raw({"compact_direct": "yes"}).compact_direct is True
+        assert ToolSearchConfig.from_raw({"compact_direct": "no"}).compact_direct is False
+        assert ToolSearchConfig.from_raw({"compact_direct": "typo"}).compact_direct is False
+
     def test_search_limits_clamped(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw({
@@ -930,3 +938,68 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+class TestTokenEconomyBridge:
+    def test_compact_bridge_is_small_and_keeps_all_three_capabilities(self):
+        from tools.tool_search import BRIDGE_TOOL_NAMES, bridge_tool_schemas, estimate_tokens_from_schemas
+        defs = bridge_tool_schemas(64, compact=True)
+        assert {td["function"]["name"] for td in defs} == set(BRIDGE_TOOL_NAMES)
+        assert estimate_tokens_from_schemas(defs) <= 300
+
+    def test_compact_bridge_does_not_embed_tool_manifest(self):
+        from tools.tool_search import bridge_tool_schemas
+        defs = bridge_tool_schemas(64, listing="secret_tool: very verbose schema", listing_form="full", compact=True)
+        rendered = json.dumps(defs)
+        assert "secret_tool" not in rendered
+        assert "tool_describe" in rendered
+
+    def test_token_economy_config_forces_catalog_off_and_compact_bridge(self, monkeypatch):
+        import hermes_cli.config as cfg_mod
+        import tools.tool_search as tool_search
+
+        monkeypatch.setattr(cfg_mod, "load_config_readonly", lambda: {
+            "token_economy": {"enabled": True, "session_mode": "short"},
+            "tools": {"tool_search": {"enabled": "auto", "listing": "auto", "listing_max_tokens": 4000}},
+            "agent": {"coding_context": "off"},
+        })
+        cfg = tool_search._config_from_loader("load_config_readonly")
+        assert cfg.compact_bridge is True
+        assert cfg.compact_direct is True
+        assert cfg.listing == "off"
+        assert cfg.listing_max_tokens <= 400
+        assert "terminal" in cfg.effective_defer_tools
+        assert "clarify" not in cfg.effective_defer_tools
+        assert cfg.enabled == "on"
+
+
+def test_token_economy_master_owns_projection_without_mutating_legacy_tool_search(monkeypatch):
+    import hermes_cli.config as cfg_mod
+    import tools.tool_search as tool_search
+
+    legacy = {
+        "enabled": "off", "listing": "on", "compact_direct": False,
+        "compact_bridge": False, "defer": ["clarify"],
+    }
+    cfg = {
+        "token_economy": {"enabled": True, "session_mode": "short"},
+        "tools": {"tool_search": dict(legacy)},
+        "agent": {"coding_context": "off"},
+    }
+    monkeypatch.setattr(cfg_mod, "load_config_readonly", lambda: cfg)
+    lean = tool_search._config_from_loader("load_config_readonly")
+    assert lean.enabled == "on"
+    assert lean.listing == "off"
+    assert lean.compact_direct is True
+    assert lean.compact_bridge is True
+    assert "clarify" not in lean.effective_defer_tools
+    assert "terminal" in lean.effective_defer_tools
+    assert cfg["tools"]["tool_search"] == legacy
+
+    cfg["token_economy"]["enabled"] = False
+    stock = tool_search._config_from_loader("load_config_readonly")
+    assert stock.enabled == "off"
+    assert stock.listing == "on"
+    assert stock.compact_direct is False
+    assert stock.compact_bridge is False
+    assert stock.effective_defer_tools == frozenset({"clarify"})

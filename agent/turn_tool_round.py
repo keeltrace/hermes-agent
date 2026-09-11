@@ -159,6 +159,24 @@ def run_tool_round(
         failed = True
         return _verdict("break")
 
+    # A successful terminal Kanban tool has already made the durable lifecycle
+    # transition. End the worker immediately instead of spending another model
+    # turn narrating a result the dispatcher already owns.
+    try:
+        from agent.kanban_stop import successful_kanban_terminal_result
+        _kanban_terminal_success = successful_kanban_terminal_result(messages)
+    except Exception:
+        logger.debug("kanban terminal-success check failed", exc_info=True)
+        _kanban_terminal_success = None
+    if _kanban_terminal_success:
+        _turn_exit_reason = f"kanban_terminal_tool({_kanban_terminal_success})"
+        final_response = ""
+        logger.info(
+            "Kanban terminal tool %s succeeded — ending worker without extra model turn",
+            _kanban_terminal_success,
+        )
+        return _verdict("break")
+
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
         _turn_exit_reason = "guardrail_halt"

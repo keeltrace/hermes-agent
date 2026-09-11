@@ -2026,14 +2026,7 @@ def _worker_terminal_timeout_env(
 
 
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
-    """Return the assigned profile's effective CLI toolsets for a worker.
-
-    Resolved at dispatch time and passed as an explicit ``--toolsets`` pin so
-    worker startup cannot fall back to a stale root/active-profile config or a
-    profile whose top-level ``toolsets`` is only the kanban orchestrator
-    surface. ``model_tools`` still appends the task-scoped kanban lifecycle
-    tools when ``HERMES_KANBAN_TASK`` is set.
-    """
+    """Return the assigned profile's effective CLI toolsets for a worker."""
     if not hermes_home:
         return None
     try:
@@ -2049,12 +2042,48 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             reset_hermes_home_override(token)
         return toolsets or None
     except Exception as exc:
-        _kb._log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
+        _kb._log.debug("kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)", hermes_home, exc)
         return None
+
+
+def _resolve_worker_prompt_controls(hermes_home: Optional[str], task: Task, workspace: str) -> tuple[Optional[str], bool]:
+    """Build bounded inline context and optional native ignore-rules mode for lean workers."""
+    if not hermes_home:
+        return None, False
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+        from utils import is_truthy_value
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config() or {}
+        finally:
+            reset_hermes_home_override(token)
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        if not isinstance(agent_cfg, dict):
+            return None, False
+        inline_enabled = is_truthy_value(agent_cfg.get("inline_kanban_context"), default=False)
+        raw_ignore = agent_cfg.get("worker_ignore_rules")
+        ignore_rules = inline_enabled if raw_ignore is None else is_truthy_value(raw_ignore, default=False)
+        if not inline_enabled:
+            return None, ignore_rules
+        try:
+            cap = max(500, min(8000, int(agent_cfg.get("inline_kanban_context_max_chars", 4000))))
+        except (TypeError, ValueError):
+            cap = 4000
+        body = (task.body or "").strip()
+        if len(body) > cap:
+            body = body[:cap] + f"... [truncated, {len(body) - cap} chars omitted]"
+        return (
+            f"Execute assigned Kanban task {task.id}.\nTitle: {task.title[:500]}\nWorkspace: {workspace}\n"
+            f"Body:\n{body or '(no body)'}\n\nWork only in the assigned workspace. Use terminal to inspect/change real files "
+            "and run acceptance checks. Use kanban_complete only when finished with evidence; use kanban_block only for a genuine external/human gate.",
+            ignore_rules,
+        )
+    except Exception as exc:
+        _kb._log.debug("kanban worker: lean prompt controls skipped (%s)", exc)
+        return None, False
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -2083,8 +2112,9 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str], workspace: str = "") -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    inline_prompt, ignore_rules = _resolve_worker_prompt_controls(hermes_home, task, workspace)
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -2096,6 +2126,8 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # configured hooks still register.
         "--accept-hooks",
     ]
+    if ignore_rules:
+        cmd.append("--ignore-rules")
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
     for sk in task.skills or ():
@@ -2114,7 +2146,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend(["chat", "-q", inline_prompt or f"work kanban task {task.id}"])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the
@@ -2253,7 +2285,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), workspace)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

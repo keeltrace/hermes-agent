@@ -100,7 +100,24 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx) if ctx else None)
+        base = budget_for_context_window(int(ctx) if ctx else None)
+        try:
+            from agent.token_economy import load_settings
+            settings = load_settings()
+            if settings.enabled:
+                return BudgetConfig(
+                    default_result_size=min(base.default_result_size, settings.live_tool_result_chars),
+                    turn_budget=min(base.turn_budget, settings.live_tool_turn_chars),
+                    preview_size=min(base.preview_size, 1200),
+                    mcp_result_size=min(base.mcp_result_size, settings.live_tool_result_chars),
+                    tool_overrides={
+                        name: min(value, settings.live_tool_result_chars)
+                        for name, value in base.tool_overrides.items()
+                    },
+                )
+        except Exception:
+            logger.debug("token-economy tool-result budget clamp failed", exc_info=True)
+        return base
     except Exception:
         return DEFAULT_BUDGET
 
@@ -1006,6 +1023,19 @@ def _commit_tool_result(
     agent._current_tool = None
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
+
+    # Archive the exact post-observation text before any spill/truncation layer changes
+    # what will ride in the transcript. A future request can replace the historical body
+    # with a result_id receipt while exact bytes remain rehydratable from the sidecar.
+    if isinstance(function_result, str):
+        try:
+            from agent.token_economy import archive_tool_result_for_agent
+            archive_tool_result_for_agent(
+                agent, tool_name=function_name, tool_call_id=tool_call_id,
+                args=function_args, content=function_result, is_error=is_error,
+            )
+        except Exception:
+            logging.debug("token-economy tool-result archive failed", exc_info=True)
 
     persisted_result = function_result
     if not _is_multimodal_tool_result(persisted_result):

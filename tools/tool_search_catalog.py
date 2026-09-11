@@ -4,6 +4,8 @@ defs plus the budgeted, byte-stable catalog listing embedded in the bridge."""
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import math
 import re
 import threading
@@ -99,8 +101,68 @@ def _classify_source(name: str) -> Tuple[str, str]:
     return ("mcp" if toolset.startswith("mcp-") else "plugin", toolset)
 
 
+def _catalog_cache_identity(tool_defs: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """Persistent-cache identity: Hermes + provider capability + live schema/source hash."""
+    try:
+        from hermes_cli import __version__
+    except Exception:
+        __version__ = "unknown"
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+        provider = str(_runtime_main_value("provider") or "unknown")
+        model = str(_runtime_main_value("model") or "unknown")
+        api_mode = str(_runtime_main_value("api_mode") or "unknown")
+    except Exception:
+        provider = model = api_mode = "unknown"
+    material = []
+    for td in tool_defs:
+        name = str(_fn(td).get("name") or "")
+        source, source_name = _classify_source(name) if name else ("other", "")
+        material.append({"name": name, "source": source, "source_name": source_name, "schema": td})
+    blob = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
+    return f"tool-search-catalog:v2:{__version__}:{provider}:{model}:{api_mode}", digest
+
+
+def _catalog_from_cache(payload: Any) -> Optional[List[CatalogEntry]]:
+    if not isinstance(payload, list):
+        return None
+    out: List[CatalogEntry] = []
+    try:
+        for item in payload:
+            if not isinstance(item, dict) or not item.get("name") or not isinstance(item.get("schema"), dict):
+                return None
+            tokens = item.get("tokens")
+            if not isinstance(tokens, list) or not all(isinstance(t, str) for t in tokens):
+                return None
+            out.append(CatalogEntry(
+                name=str(item["name"]), description=str(item.get("description") or ""),
+                schema=item["schema"], source=str(item.get("source") or "other"),
+                source_name=str(item.get("source_name") or ""), _tokens=list(tokens)))
+    except Exception:
+        return None
+    return out
+
+
+def _catalog_cache_payload(catalog: List[CatalogEntry]) -> List[Dict[str, Any]]:
+    return [{"name": e.name, "description": e.description, "schema": e.schema, "source": e.source,
+             "source_name": e.source_name, "tokens": list(e._tokens)} for e in catalog]
+
+
 def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
-    """Build the deferred-tool catalog from the deferrable subset of tool-defs."""
+    """Build the deferred catalog, persistently caching tokenization by exact schema hash."""
+    cache_key = schema_hash = None
+    try:
+        from agent.token_economy import load_settings
+        if load_settings().enabled:
+            cache_key, schema_hash = _catalog_cache_identity(tool_defs)
+            from agent.token_economy_store import get_capability_cache
+            cached = _catalog_from_cache(get_capability_cache(cache_key, schema_hash))
+            if cached is not None:
+                return cached
+    except Exception:
+        cache_key = schema_hash = None
+
     catalog: List[CatalogEntry] = []
     for td in tool_defs:
         fn = _fn(td)
@@ -108,11 +170,16 @@ def build_catalog(tool_defs: List[Dict[str, Any]]) -> List[CatalogEntry]:
         if not name:
             continue
         source, source_name = _classify_source(name)
-        # Index the human-facing label ("linear", not "mcp-linear").
         source_label = _listing_group_label(source_name) if source_name else ""
         catalog.append(CatalogEntry(
             name=name, description=fn.get("description", "") or "", schema=td, source=source,
             source_name=source_name, _tokens=_tokenize(_entry_search_text(td, source_label))))
+    if cache_key and schema_hash:
+        try:
+            from agent.token_economy_store import put_capability_cache
+            put_capability_cache(cache_key, schema_hash, _catalog_cache_payload(catalog))
+        except Exception:
+            pass
     return catalog
 
 

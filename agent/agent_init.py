@@ -1061,6 +1061,22 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    # Counterfactual schema cost for diagnostics: compute once at agent init with Tool
+    # Search assembly bypassed. This never reaches the model and lets the Token Ledger
+    # report lazy-schema savings without relying on the historical 8.4K baseline.
+    agent._token_economy_lazy_schema_saved_tokens = 0
+    try:
+        from agent.token_economy import load_settings
+        if load_settings().enabled:
+            from tools.tool_search import estimate_tokens_from_schemas
+            _raw_tool_defs = model_tools.get_tool_definitions(
+                enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+                quiet_mode=True, skip_tool_search_assembly=True,
+            )
+            agent._token_economy_lazy_schema_saved_tokens = max(
+                0, estimate_tokens_from_schemas(_raw_tool_defs) - estimate_tokens_from_schemas(agent.tools or []))
+    except Exception:
+        logger.debug("token-economy schema counterfactual skipped", exc_info=True)
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
@@ -1231,6 +1247,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._memory_prompt_enabled = True
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
@@ -1255,6 +1272,19 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
             )
+            agent._memory_prompt_enabled = is_truthy_value(
+                mem_config.get("inject_context"), default=True
+            )
+            # Token economy changes only the provider projection. Durable memory
+            # stores and the memory tool stay enabled; the master flag restores
+            # the user's legacy inject_context setting without mutating config.
+            try:
+                from agent.token_economy import load_settings as _load_token_economy_settings
+                _te_settings = _load_token_economy_settings()
+                if _te_settings.enabled:
+                    agent._memory_prompt_enabled = bool(_te_settings.memory_prompt_injection)
+            except Exception:
+                pass
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 agent._memory_store = MemoryStore(
@@ -1855,6 +1885,15 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
+    # Token-economy mode adds an absolute lifecycle ceiling and deterministic early
+    # result pruning. It intentionally disables micro-compaction because rewriting the
+    # sent prefix each turn defeats provider prompt caching.
+    try:
+        from agent.token_economy import apply_compressor_policy
+        if apply_compressor_policy(agent):
+            cs.micro_compact = False
+    except Exception:
+        logger.debug("token-economy compressor setup skipped", exc_info=True)
     # Micro-compaction has no pre-compress checkpoint hook; suppress it while the gate is
     # armed (mirrors native_compaction.py).
     if cs.checkpoint_required and cs.micro_compact:

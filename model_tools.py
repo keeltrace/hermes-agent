@@ -59,6 +59,32 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+def _configured_tool_allowlist() -> Optional[set[str]]:
+    """Return an optional exact tool-name allowlist for the active profile.
+
+    Toolsets are ergonomic bundles and can be much larger than a low-TPM
+    headless worker needs. ``agent.tool_allowlist`` is a final intersection
+    over the resolved toolsets so a lean worker can keep only execution and
+    lifecycle tools without changing normal profile behavior.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_config
+        cfg = _load_config() or {}
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        if not isinstance(agent_cfg, dict) or "tool_allowlist" not in agent_cfg:
+            return None
+        raw = agent_cfg.get("tool_allowlist")
+        if raw is None:
+            return None
+        if not isinstance(raw, list):
+            logger.warning("agent.tool_allowlist must be a list of exact tool names; ignoring invalid value")
+            return None
+        return {str(name).strip() for name in raw if str(name).strip()}
+    except Exception:
+        logger.debug("Could not resolve agent.tool_allowlist", exc_info=True)
+        return None
+
+
 # --- Async bridging (single source of truth; registry.dispatch uses it too) ---
 # Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
 # clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
@@ -251,6 +277,34 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     return list(cached)
 
 
+def _token_economy_projection_cache_scope() -> tuple[str, str]:
+    """Stable cache discriminator for the model-facing token-economy tool projection.
+
+    Tool definitions are process-cached, while ``session_mode=auto`` can resolve
+    differently for interactive chat, coding workspaces, cron, subagents, and
+    Kanban workers in the same long-lived process. The config-file fingerprint is
+    insufficient because those session facts can change without editing config.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        te = cfg.get("token_economy") if isinstance(cfg, dict) else None
+        if not isinstance(te, dict):
+            return ("stock", "")
+        raw_enabled = te.get("enabled", False)
+        enabled = raw_enabled if isinstance(raw_enabled, bool) else str(raw_enabled).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if not enabled:
+            return ("stock", "")
+        from tools.token_lean_profile import token_lean_session_mode
+        return ("token-economy", token_lean_session_mode(config=cfg))
+    except Exception:
+        # Fail closed for cache correctness: an unresolved scope gets its own
+        # discriminator instead of masquerading as a known short/work surface.
+        return ("unknown", "")
+
+
 def _tool_defs_cache_key(
     enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], skip_tool_search_assembly: bool,
 ) -> Optional[tuple]:
@@ -274,6 +328,7 @@ def _tool_defs_cache_key(
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _token_economy_projection_cache_scope(),
     )
 
 
@@ -491,6 +546,16 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
                               quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
+    tool_allowlist = _configured_tool_allowlist()
+    if tool_allowlist is not None:
+        worker_owns_task = (
+            bool(os.environ.get("HERMES_KANBAN_TASK"))
+            and not _is_delegated_child_context()
+            and _is_dispatcher_owned_worker()
+        )
+        if worker_owns_task:
+            tool_allowlist.update({"kanban_complete", "kanban_block"})
+        tools_to_include.intersection_update(tool_allowlist)
     # Registry returns only tools whose check_fn passes.
     filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
     global _last_resolved_tool_names
@@ -515,6 +580,10 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+            # Build the progressive-disclosure catalog from canonical full schemas.
+            # Compact only the final model-visible direct waist afterwards so
+            # tool_describe/tool_call retain full contracts and prompt-cache bytes
+            # stay stable across the session.
             assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
             if assembly.activated and not quiet_mode:
                 print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
@@ -522,6 +591,9 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
                       f"tool_search/describe/call — "
                       f"{_TOOL_SEARCH_LISTING_FORMS.get(assembly.listing_form, assembly.listing_form)}.")
             filtered_tools = assembly.tool_defs
+        if not skip_tool_search_assembly and ts_cfg.compact_direct:
+            from tools.lean_tool_schemas import compact_direct_tool_schemas
+            filtered_tools = compact_direct_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 

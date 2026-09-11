@@ -29,8 +29,15 @@ def _bytes(s: str) -> int:
     return len(s.encode("utf-8"))
 
 
+def _estimated_tokens_from_chars(chars: int) -> int:
+    # Deliberately simple and stable: the same chars/4 estimator used by the
+    # token-economy ledger for pre-provider budgeting. Provider usage remains
+    # authoritative once a real request is made.
+    return (max(0, int(chars)) + 3) // 4
+
+
 def _size(text: str) -> Dict[str, int]:
-    return {"chars": len(text), "bytes": _bytes(text)}
+    return {"chars": len(text), "bytes": _bytes(text), "estimated_tokens": _estimated_tokens_from_chars(len(text))}
 
 
 def _fmt_kb(n: int) -> str:
@@ -167,14 +174,17 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     store = getattr(agent, "_memory_store", None)
     if store is not None:
         try:
-            if getattr(agent, "_memory_enabled", True):
-                memory_block = store.format_for_system_prompt("memory") or ""
-            if getattr(agent, "_user_profile_enabled", True):
-                user_block = store.format_for_system_prompt("user") or ""
+            if getattr(agent, "_memory_prompt_enabled", True):
+                if getattr(agent, "_memory_enabled", True):
+                    memory_block = store.format_for_system_prompt("memory") or ""
+                if getattr(agent, "_user_profile_enabled", True):
+                    user_block = store.format_for_system_prompt("user") or ""
         except Exception:
             pass
 
     tools = getattr(agent, "tools", None) or []
+    tools_json = json.dumps(tools, ensure_ascii=False)
+    tools_estimated_tokens = _estimated_tokens_from_chars(len(tools_json))
     sections: List[Tuple[str, int, int]] = [
         (label, len(text), _bytes(text))
         for label, text in (("stable (identity/guidance/skills)", stable), ("context (AGENTS.md/cwd files)", context),
@@ -187,7 +197,10 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "skills_index": _size(skills_index),
         "memory": _size(memory_block),
         "user_profile": _size(user_block),
-        "tools": {"count": len(tools), "json_bytes": _bytes(json.dumps(tools, ensure_ascii=False))},
+        "tools": {"count": len(tools), "names": [_tool_name(tool) for tool in tools],
+                  "json_bytes": _bytes(tools_json), "chars": len(tools_json),
+                  "estimated_tokens": tools_estimated_tokens},
+        "fixed_total_estimated_tokens": _size(full)["estimated_tokens"] + tools_estimated_tokens,
         "sections": sections,
         "skills_breakdown": _compute_skills_breakdown(skills_index),
         "toolsets_breakdown": _compute_toolsets_breakdown(tools),
@@ -200,14 +213,15 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     tools = data["tools"]
     lines: List[str] = [
         f"Prompt-size breakdown (platform={data['platform']}, model={data['model'] or 'unset'})", "",
-        f"  System prompt total : {sp['bytes']:>8,} B  ({_fmt_kb(sp['bytes'])}, {sp['chars']:,} chars)", "",
+        f"  System prompt total : {sp['bytes']:>8,} B  ({_fmt_kb(sp['bytes'])}, {sp['chars']:,} chars, ~{sp['estimated_tokens']:,} tok)",
+        f"  Fixed cold-start est.: ~{data.get('fixed_total_estimated_tokens', 0):,} tokens (system + tool schemas)", "",
         "  Major blocks:",
     ]
     for label, key in (("skills index", "skills_index"), ("memory", "memory"), ("user profile", "user_profile")):
         byts = data[key]["bytes"]
         lines.append(f"    {label:<19}: {byts:>8,} B  ({_fmt_kb(byts)})")
     lines += ["", "  Prompt tiers:"] + [f"    {label:<36}: {byts:>8,} B  ({_fmt_kb(byts)})" for label, _chars, byts in data["sections"]]
-    lines += ["", f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)"]
+    lines += ["", f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools, ~{tools.get('estimated_tokens', 0):,} tok)"]
 
     if toolsets := data.get("toolsets_breakdown") or []:
         lines += ["", "  Toolsets by size (tool-schema JSON, largest first):", f"    {'toolset':<22} {'tools':>5}  {'schema':>10}"]

@@ -91,6 +91,27 @@ def _fire_pre_api_request_hook(
         pass
 
 
+def _project_token_economy_messages(agent: Any, api_messages: Any) -> tuple[Any, int]:
+    """Project canonical chat messages before any provider transport rewrites IDs/shapes.
+
+    This keeps archive lookup keyed on Hermes' original ``tool_call_id`` even when
+    Responses later clamps/hashes it, and lets every transport inherit the same
+    copy-on-write receipt/task-state policy.
+    """
+    if not isinstance(api_messages, list):
+        return api_messages, 0
+    saved = 0
+    try:
+        from agent.token_economy import externalize_historical_tool_results, project_task_state
+        wrapper, saved = externalize_historical_tool_results({"messages": api_messages}, agent)
+        wrapper = project_task_state(wrapper, agent)
+        projected = wrapper.get("messages") if isinstance(wrapper, dict) else None
+        return projected if isinstance(projected, list) else api_messages, int(saved or 0)
+    except Exception:
+        logger.debug("token-economy canonical message projection failed; sending canonical payload", exc_info=True)
+        return api_messages, 0
+
+
 def build_api_request(
     agent: Any, *, api_messages: Any, _moa_prepared_request: Any, tools_for_api: Any,
     system_message: Any, messages: Any, original_user_message: Any, approx_tokens: Any,
@@ -110,6 +131,11 @@ def build_api_request(
     # require reasoning_content — re-apply the echo-back pad (idempotent) and re-render
     # the prompt-cache decoration for the current provider.
     agent._reapply_reasoning_echo_for_provider(api_messages)
+    # Project before cache decoration and before provider transport conversion.
+    # Cache decoration can wrap textual role:tool content in parts, while Responses
+    # can rewrite/clamp call IDs; both transformations make exact archival lookup
+    # harder and can disguise text as protected multimodal/list content.
+    api_messages, _token_economy_saved = _project_token_economy_messages(agent, api_messages)
     api_messages, _moa_prepared_request, tools_for_api = (
         _redecorate_prompt_cache_for_provider(
             agent, api_messages, system_message=system_message, moa_prepared=_moa_prepared_request,
@@ -145,6 +171,7 @@ def build_api_request(
     if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
         _set_extra_header(api_kwargs, "x-initiator", "user")
         agent._is_user_initiated_turn = False
+
     try:
         from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -160,6 +187,18 @@ def build_api_request(
     except Exception:
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
+
+    # Capture the exact post-middleware request attempt. Logical api_request_id is reused
+    # across retries, so the ledger adds :try:N and closes any unanswered prior attempt.
+    try:
+        from agent.token_economy import capture_request
+        capture_request(
+            agent, api_kwargs, api_request_id=str(api_request_id), turn_id=turn_id,
+            task_id=effective_task_id, api_call_index=int(api_call_count or 0),
+            retry_count=int(retry_count or 0), local_deduplicated_tokens=_token_economy_saved,
+        )
+    except Exception:
+        logger.debug("token-economy request capture failed", exc_info=True)
 
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,

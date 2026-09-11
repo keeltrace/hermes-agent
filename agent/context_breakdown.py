@@ -65,10 +65,11 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
     memory_block = user_block = ""
     store = getattr(agent, "_memory_store", None)
     try:
-        if store is not None and getattr(agent, "_memory_enabled", True):
-            memory_block = store.format_for_system_prompt("memory") or ""
-        if store is not None and getattr(agent, "_user_profile_enabled", True):
-            user_block = store.format_for_system_prompt("user") or ""
+        if store is not None and getattr(agent, "_memory_prompt_enabled", True):
+            if getattr(agent, "_memory_enabled", True):
+                memory_block = store.format_for_system_prompt("memory") or ""
+            if getattr(agent, "_user_profile_enabled", True):
+                user_block = store.format_for_system_prompt("user") or ""
     except Exception:
         pass
     return memory_block, user_block

@@ -28,6 +28,47 @@ from agent.turn_context_compaction import (
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _token_economy_prune_before_llm(agent: Any, compressor: Any,
+                                    messages: List[Dict[str, Any]],
+                                    current_tokens: int, *, reason: str
+                                    ) -> tuple[List[Dict[str, Any]], int, int]:
+    """Try deterministic tool-result reclamation before any summary-LLM call.
+
+    The existing compressor owns eligibility, persistence, tail protection and
+    cache-hysteresis. This helper only changes ORDER while token-economy is on:
+    cheap/loss-minimized pruning gets first refusal; full LLM compression remains
+    the fallback when pruning cannot commit meaningful savings.
+    """
+    try:
+        from agent.token_economy import load_settings
+        if not load_settings().enabled:
+            return messages, current_tokens, 0
+    except Exception:
+        return messages, current_tokens, 0
+    prune = getattr(compressor, "prune_tool_results_only", None)
+    if not callable(prune):
+        return messages, current_tokens, 0
+    try:
+        pruned, count = prune(messages, current_tokens=current_tokens)
+    except Exception:
+        logger.debug("token-economy deterministic prune failed before LLM compression", exc_info=True)
+        return messages, current_tokens, 0
+    if not count or pruned is messages:
+        return messages, current_tokens, 0
+    saved = 0
+    try:
+        from agent.token_economy import note_compaction
+        saved = int(note_compaction(agent, messages, pruned, reason=reason) or 0)
+    except Exception:
+        logger.debug("token-economy deterministic prune accounting failed", exc_info=True)
+    adjusted = max(0, int(current_tokens or 0) - max(0, saved))
+    logger.info(
+        "Token economy deterministic prune preempted summary-LLM compression: %s result(s), ~%s tokens saved",
+        count, saved,
+    )
+    return pruned, adjusted, int(count)
+
+
 @dataclass
 class PreflightGateVerdict:
     """``action``: ``"fallthrough"`` (make the API call), ``"continue"`` (window grown or
@@ -90,6 +131,21 @@ def run_preflight_compression(
         and len(v.messages) > 1
         and v.compression_attempts < max_compression_attempts
     )
+    # Token economy gives deterministic reclamation first refusal. The compressor's
+    # own proactive_prune_tokens/rearm hysteresis decides when it is worthwhile;
+    # this does NOT consume an LLM-compression attempt. A committed prune invalidates
+    # the already-assembled request (including any MoA payload), so re-enter the loop.
+    if agent.compression_enabled and len(v.messages) > 1:
+        _pruned_messages, _pruned_pressure, _pruned_count = _token_economy_prune_before_llm(
+            agent, compressor, v.messages, request_pressure_tokens,
+            reason="pre_api_deterministic_tool_result_prune",
+        )
+        if _pruned_count and _pruned_messages is not v.messages:
+            v.messages = _pruned_messages
+            v.pending_moa_prepared_request = None
+            v.api_call_count = _refund_api_call(agent, v.api_call_count)
+            _clear_overflow_warn(agent)
+            return _done("continue")
     if (
         _eligible
         and not _review_fork_first_request_pending(agent)
@@ -145,6 +201,11 @@ def run_preflight_compression(
             v.messages, system_message, approx_tokens=request_pressure_tokens,
             task_id=effective_task_id,
         )
+        try:
+            from agent.token_economy import note_compaction
+            note_compaction(agent, _pre_api_input, v.messages, reason="pre_api_budget")
+        except Exception:
+            logger.debug("token-economy pre-API compaction accounting failed", exc_info=True)
         if context_compression_timed_out(agent):
             # Progress-aware timeout: never reached the provider — refund the
             # call/budget and stop; an overflow retry would only re-compress.
@@ -285,6 +346,19 @@ def compress_after_tool_results(
             estimate_request_tokens_rough(messages, tools=agent.tools or None),
         )
 
+    if agent.compression_enabled:
+        _pruned_messages, _pruned_tokens, _pruned_count = _token_economy_prune_before_llm(
+            agent, _compressor, messages, _real_tokens,
+            reason="post_tool_deterministic_tool_result_prune",
+        )
+        if _pruned_count and _pruned_messages is not messages:
+            # Do not stack a cache-breaking deterministic rewrite and a summary-LLM
+            # rewrite in one tool round. The outer loop immediately rebuilds and
+            # remeasures; full compression remains available there if still needed.
+            messages = _pruned_messages
+            _real_tokens = _pruned_tokens
+            return _verdict(False)
+
     if (
         agent.compression_enabled
         and compression_attempts < max_compression_attempts
@@ -304,6 +378,11 @@ def compress_after_tool_results(
         messages, active_system_prompt = agent._compress_context(
             messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id
         )
+        try:
+            from agent.token_economy import note_compaction
+            note_compaction(agent, _post_tool_input, messages, reason="post_tool_budget")
+        except Exception:
+            logger.debug("token-economy post-tool compaction accounting failed", exc_info=True)
         if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
             # Lock-skip no-op is a temporary defer, not evidence about compressibility:
             # refund so a lock-loser loop doesn't burn the budget toward exhausted.
@@ -373,5 +452,11 @@ def compress_after_tool_results(
             # conversation_history: rows already carry _DB_PERSISTED_MARKER, and on a
             # stale in-place flag the helper could seed unpersisted rows.
             if _pruned_n and _pruned_msgs is not messages:
+                _before_prune = messages
                 messages = _pruned_msgs
+                try:
+                    from agent.token_economy import note_compaction
+                    note_compaction(agent, _before_prune, messages, reason="deterministic_tool_result_prune")
+                except Exception:
+                    logger.debug("token-economy prune accounting failed", exc_info=True)
     return _verdict(False)

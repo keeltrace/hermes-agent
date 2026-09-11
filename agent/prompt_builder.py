@@ -1039,9 +1039,24 @@ def _dynamic_context_file_max_chars(context_length: Optional[int]) -> int:
 
 
 def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
-    """Context-file truncation limit: explicit config.yaml ``context_file_max_chars`` wins, else the dynamic cap."""
-    val = _config_readonly("context_file_max_chars").get("context_file_max_chars")
-    return int(val) if isinstance(val, (int, float)) and val > 0 else _dynamic_context_file_max_chars(context_length)
+    """Context-file cap: token-economy projection while enabled, then legacy override.
+
+    Huge nominal model windows must not silently turn AGENTS.md/CLAUDE.md into a
+    six-figure-character fixed prompt. Token-economy keeps the same authoritative
+    source and existing head/tail truncation semantics, but bounds its recurring cost.
+    """
+    cfg = _config_readonly("context_file_max_chars")
+    te = cfg.get("token_economy") if isinstance(cfg, dict) else None
+    if isinstance(te, dict):
+        enabled = te.get("enabled", False)
+        enabled = enabled if isinstance(enabled, bool) else str(enabled).strip().lower() in {"1", "true", "yes", "on"}
+        lean_cap = te.get("context_file_max_chars")
+        if enabled and isinstance(lean_cap, (int, float)) and lean_cap > 0:
+            return max(2000, min(int(lean_cap), 100000))
+    val = cfg.get("context_file_max_chars")
+    if isinstance(val, (int, float)) and val > 0:
+        return int(val)
+    return _dynamic_context_file_max_chars(context_length)
 
 
 # Truncation warnings for run_agent to surface. A ContextVar so concurrent gateway prompt builds cannot

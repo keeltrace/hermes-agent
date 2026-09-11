@@ -119,3 +119,17 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
 
 
 
+
+
+def test_prompt_size_reports_fixed_token_estimate(isolated_home):
+    data = compute_prompt_breakdown("cli")
+    assert data["system_prompt"]["estimated_tokens"] == (data["system_prompt"]["chars"] + 3) // 4
+    assert data["tools"]["estimated_tokens"] == (data["tools"]["chars"] + 3) // 4
+    assert data["fixed_total_estimated_tokens"] == (
+        data["system_prompt"]["estimated_tokens"] + data["tools"]["estimated_tokens"]
+    )
+    assert len(data["tools"]["names"]) == data["tools"]["count"]
+    assert all(isinstance(name, str) and name for name in data["tools"]["names"])
+    rendered = render_breakdown(data)
+    assert "Fixed cold-start est." in rendered
+    assert "tok" in rendered

@@ -37,6 +37,36 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
 _GATE_WORDS = {**dict.fromkeys(("true", "always", "yes", "on"), True), **dict.fromkeys(("false", "never", "no", "off"), False)}
 
 
+_LEAN_HERMES_HELP = (
+    "You run on Hermes Agent by Nous Research. For Hermes-specific setup or troubleshooting, "
+    "use https://hermes-agent.nousresearch.com/docs as the current reference."
+)
+_LEAN_EXECUTION_GUIDANCE = (
+    "Use tools for requested actions, builds, checks, or current evidence; do not merely describe future work. "
+    "Batch independent calls. Never invent tool output. Verify relevant results before claiming success; if blocked, "
+    "report the real blocker and try a safe alternative."
+)
+_LEAN_KANBAN_GUIDANCE = (
+    "For an assigned Kanban task, do the real work and call kanban_complete only with evidence; "
+    "use kanban_block only for a genuine external blocker."
+)
+_LEAN_CODING_GUIDANCE = (
+    "Inspect relevant code before editing and never invent files, APIs, or dependencies. Batch independent reads. "
+    "Use patch for targeted edits and write_file for new/replacement files; preserve project conventions and touch only "
+    "what the task needs. Run the relevant tests/lint/build before claiming success. Do not commit, push, rewrite history, "
+    "or expose secrets unless explicitly asked. Be concise and cite paths/lines instead of pasting whole files."
+)
+
+
+def _token_economy_prompt_mode(agent: Any) -> tuple[bool, str]:
+    try:
+        from agent.token_economy import load_settings, session_mode
+        settings = load_settings()
+        return bool(settings.enabled and settings.compact_prompt), session_mode(agent, settings)
+    except Exception:
+        return False, "short"
+
+
 def _model_gate(setting: Any, model: Optional[str], default_models) -> bool:
     """Resolve a config gate: True/"true"-ish -> on, False/"false"-ish -> off,
     list -> case-insensitive model-substring match, anything else ("auto") ->
@@ -348,6 +378,10 @@ def _active_profile_line(agent: Any) -> str:
     otherwise print "default" for a bot profile)."""
     _agent_home_path = _agent_home(agent)
     active_profile = _active_profile_name(agent, _ambient_file_safety_profile_name)
+    compact, _mode = _token_economy_prompt_mode(agent)
+    if compact:
+        home = _agent_home_path or get_default_hermes_root()
+        return f"Active Hermes profile: {active_profile}; profile data root: {home}. Do not modify other profiles unless asked."
     if active_profile == "default":
         # With an explicit agent home, the default profile's data lives at the
         # ROOT (get_hermes_home() on a bound profile session is the PROFILE dir).
@@ -462,7 +496,7 @@ def _memory_parts(agent: Any) -> List[str]:
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
     tools the toolset config gated off)."""
     parts: List[str] = []
-    if agent._memory_store:
+    if agent._memory_store and getattr(agent, "_memory_prompt_enabled", True):
         for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
             block = agent._memory_store.format_for_system_prompt(kind) if enabled else None
             if block:
@@ -470,7 +504,7 @@ def _memory_parts(agent: Any) -> List[str]:
     # External memory provider system prompt block (additive to built-in). Gated on the same check
     # ``inject_memory_provider_tools`` uses so we never advertise provider tools that the agent's toolset
     # configuration has already gated off (#81014).
-    if agent._memory_manager:
+    if agent._memory_manager and getattr(agent, "_memory_prompt_enabled", True):
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
@@ -495,7 +529,21 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
 
 
 def _guidance_parts(agent: Any) -> List[str]:
-    """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
+    """Universal + tool-aware + model-gated guidance blocks.
+
+    Token-economy collapses duplicated operational prose into one equivalent
+    invariant block; disabling the rollout flag preserves stock bytes.
+    """
+    compact, _mode = _token_economy_prompt_mode(agent)
+    if compact:
+        parts: List[str] = []
+        if agent.valid_tool_names:
+            parts.append(_LEAN_EXECUTION_GUIDANCE)
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                parts.append(_LEAN_KANBAN_GUIDANCE)
+            if any(g in (agent.model or "").lower() for g in ("gemini", "gemma")):
+                parts.append("For file work, use absolute paths, inspect before editing, and prefer non-interactive commands.")
+        return parts
     parts: List[str] = []
     if agent.valid_tool_names:
         parts += [
@@ -619,19 +667,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
     _help_guidance_slot = len(stable_parts)
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    _compact_prompt, _token_mode = _token_economy_prompt_mode(agent)
+    stable_parts.append(_LEAN_HERMES_HELP if _compact_prompt else HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
     stable_parts.extend(_guidance_parts(agent))
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
-    if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
+    if (not _compact_prompt and "skill_view" in (agent.valid_tool_names or set())
+            and "- hermes-agent:" in skills_prompt):
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Coding posture: the operating brief stays in the stable prefix. The
     # environment block contains the current cwd/backend and belongs after
     # project context, not ahead of a large shared AGENTS.md block.
-    environment_hints = _pb.build_environment_hints()
+    environment_hints = "" if (_compact_prompt and _token_mode == "short") else _pb.build_environment_hints()
     coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = _coding_parts(agent)
+    if _compact_prompt and coding_prefix_parts:
+        coding_prefix_parts = [_LEAN_CODING_GUIDANCE]
     stable_parts.extend(coding_prefix_parts)
     post_workspace_parts = _post_workspace_parts(agent)
     # ── Context tier (project/worktree-dependent, may change between sessions) ──

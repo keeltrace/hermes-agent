@@ -262,7 +262,7 @@ class TestConfig:
         assert provider._auto_retain is True
         assert provider._auto_recall is True
         assert provider._retain_every_n_turns == 1
-        assert provider._recall_max_tokens == 4096
+        assert provider._recall_max_tokens == 256
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
         assert provider._observation_scopes is None

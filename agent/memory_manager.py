@@ -10,6 +10,7 @@ import contextvars
 import inspect
 import json
 import logging
+import os
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -30,6 +31,8 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_MEMORY_PREFETCH_MAX_CHARS = 800
+_MEMORY_PREFETCH_TRUNCATION_MARKER = "\n[Memory recall truncated to relevance budget.]"
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -293,7 +296,8 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
+                 prefetch_max_chars: Optional[int] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
@@ -303,6 +307,22 @@ class MemoryManager:
         if timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_timeout = timeout
+        if prefetch_max_chars is None:
+            raw_limit = os.environ.get("HERMES_MEMORY_PREFETCH_MAX_CHARS", "").strip()
+            if raw_limit:
+                try:
+                    prefetch_max_chars = int(raw_limit)
+                except ValueError:
+                    logger.warning(
+                        "Invalid HERMES_MEMORY_PREFETCH_MAX_CHARS=%r; using %d",
+                        raw_limit, _MEMORY_PREFETCH_MAX_CHARS,
+                    )
+                    prefetch_max_chars = _MEMORY_PREFETCH_MAX_CHARS
+            else:
+                prefetch_max_chars = _MEMORY_PREFETCH_MAX_CHARS
+        if prefetch_max_chars < 0:
+            raise ValueError("prefetch_max_chars must be >= 0")
+        self._prefetch_max_chars = int(prefetch_max_chars)
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
@@ -399,7 +419,19 @@ class MemoryManager:
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
-        return "\n\n".join(p for p in parts if p and p.strip())
+        merged = "\n\n".join(p for p in parts if p and p.strip())
+        if self._prefetch_max_chars and len(merged) > self._prefetch_max_chars:
+            marker = _MEMORY_PREFETCH_TRUNCATION_MARKER
+            content_budget = max(0, self._prefetch_max_chars - len(marker))
+            clipped = merged[:content_budget].rstrip()
+            # Provider output is relevance-ranked. Prefer a complete line near the
+            # boundary so a lower-ranked memory is not injected half-written.
+            last_newline = clipped.rfind("\n")
+            if last_newline >= max(0, content_budget // 2):
+                clipped = clipped[:last_newline].rstrip()
+            merged = clipped + marker
+            logger.info("Memory prefetch context capped at %d chars", self._prefetch_max_chars)
+        return merged
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external

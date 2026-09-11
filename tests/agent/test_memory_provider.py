@@ -239,6 +239,27 @@ class TestMemoryManager:
         assert p2.prefetch_queries == ["what do you know?"]
 
 
+    def test_prefetch_all_caps_automatic_recall(self):
+        mgr = MemoryManager(prefetch_max_chars=120)
+        provider = FakeMemoryProvider("builtin")
+        provider._prefetch_result = "top fact\n" + ("lower-ranked memory\n" * 40)
+        mgr.add_provider(provider)
+
+        result = mgr.prefetch_all("what do you remember?")
+
+        assert len(result) <= 120
+        assert result.startswith("top fact")
+        assert result.endswith("[Memory recall truncated to relevance budget.]")
+
+    def test_prefetch_all_cap_can_be_explicitly_disabled(self):
+        mgr = MemoryManager(prefetch_max_chars=0)
+        provider = FakeMemoryProvider("builtin")
+        provider._prefetch_result = "x" * 2000
+        mgr.add_provider(provider)
+
+        assert mgr.prefetch_all("what do you remember?") == "x" * 2000
+
+
     def test_queue_prefetch_all(self):
         mgr = MemoryManager()
         p1 = FakeMemoryProvider("builtin")

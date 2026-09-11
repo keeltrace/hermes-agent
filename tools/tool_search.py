@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import math
+import os
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -45,6 +46,8 @@ class ToolSearchConfig:
     max_search_limit: int
     listing: str = "auto"  # "auto"/"on" = embed the manifest when it fits; "off" = bare bridge
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
+    compact_direct: bool = False  # compact descriptions for terminal/file direct-waist schemas
+    compact_bridge: bool = False  # terse progressive-disclosure bridge for token-economy mode
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
 
@@ -68,6 +71,8 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
+            compact_direct=_safe_bool(raw.get("compact_direct"), False),
+            compact_bridge=_safe_bool(raw.get("compact_bridge"), False),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
                          if isinstance(defer_raw, (list, tuple, set)) else None))
 
@@ -97,13 +102,45 @@ def _safe_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+def _safe_bool(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
+    return fallback
+
+
 def _config_from_loader(loader_name: str) -> ToolSearchConfig:
-    """Tool-search config via ``hermes_cli.config.<loader_name>`` (defaults on any failure)."""
+    """Tool-search config, with token-economy's session-stable lean profile applied.
+
+    While enabled, token economy owns the model-facing discovery projection. Disabling
+    the master flag restores the user's Tool Search settings without mutating config.yaml.
+    """
     try:
         import hermes_cli.config as _cfg_mod
-        tools_cfg = (getattr(_cfg_mod, loader_name)() or {}).get("tools")
+        cfg = getattr(_cfg_mod, loader_name)() or {}
+        tools_cfg = cfg.get("tools") if isinstance(cfg, dict) else None
         tools_cfg = tools_cfg if isinstance(tools_cfg, dict) else {}
-        return ToolSearchConfig.from_raw(tools_cfg.get("tool_search"))
+        raw = tools_cfg.get("tool_search")
+        te = cfg.get("token_economy") if isinstance(cfg, dict) else None
+        te_enabled = isinstance(te, dict) and _safe_bool(te.get("enabled"), False)
+        if te_enabled:
+            # The master flag is the transactional boundary: runtime projection
+            # becomes lean without rewriting legacy tools.tool_search settings.
+            raw = dict(raw) if isinstance(raw, dict) else {}
+            raw["enabled"] = "on"
+            raw["compact_direct"] = True
+            raw["compact_bridge"] = True
+            raw["listing"] = "off"
+            raw["listing_max_tokens"] = min(_clamped_int(raw.get("listing_max_tokens"), 400, 200, 60000), 400)
+            from tools.token_lean_profile import token_lean_defer_tools
+            raw["defer"] = token_lean_defer_tools(config=cfg)
+        return ToolSearchConfig.from_raw(raw)
     except Exception as e:
         logger.debug("Failed to load tool-search config: %s", e)
         return ToolSearchConfig.from_raw(None)
@@ -139,11 +176,21 @@ _DEFAULT_DEFERRED_TOOLS = frozenset({
     "apply_layout", "read_terminal", "read_window_below", "focus_pane"})
 
 
+def _dispatcher_lifecycle_tool(name: str) -> bool:
+    if name not in {"kanban_complete", "kanban_block"} or not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        return bool(is_dispatcher_owned_worker_context())
+    except Exception:
+        return True
+
+
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
     plugin tool). Bridge names never defer."""
-    if name in BRIDGE_TOOL_NAMES:
+    if name in BRIDGE_TOOL_NAMES or _dispatcher_lifecycle_tool(name):
         return False
     if defer_tools is not None and name in defer_tools:
         return True
@@ -260,10 +307,27 @@ def _search_description(deferred_count: int, listing: Optional[str], listing_for
 
 
 def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
-                        listing_form: str = "", connections_granted: bool = False) -> List[Dict[str, Any]]:
+                        listing_form: str = "", connections_granted: bool = False,
+                        compact: bool = False) -> List[Dict[str, Any]]:
     """Bridge tool schemas injected in place of deferred tools; kept short — every byte is paid
     every turn. ``listing`` is embedded in the tool_search description; per-tool forms say
     "skip search when you see the exact name", "groups" says search is mandatory."""
+    if compact:
+        return [
+            _bridge_schema(
+                TOOL_SEARCH_NAME,
+                f"Find deferred tools ({deferred_count} local/plugin tools plus available connectors). Return names; use tool_describe only when argument shape is unknown.",
+                {"queries": {"type": "array", "items": {"type": "string"}},
+                 "limit": {"type": "integer", "minimum": 1}}, ["queries"]),
+            _bridge_schema(
+                TOOL_DESCRIBE_NAME, "Load full JSON schemas for deferred tool names.",
+                {"names": {"type": "array", "items": {"type": "string"}}}, ["names"]),
+            _bridge_schema(
+                TOOL_CALL_NAME, "Invoke deferred tools by exact name with schema-valid arguments.",
+                {"calls": {"type": "array", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "arguments": {"type": "object"}},
+                    "required": ["name", "arguments"]}}}, ["calls"]),
+        ]
     return [
         _bridge_schema(
             TOOL_SEARCH_NAME,
@@ -347,7 +411,8 @@ def assemble_tool_defs(tool_defs: List[Dict[str, Any]], *, context_length: Optio
     connections_granted = connections_in_scope(incoming)
     if not deferrable:
         if should_activate(config, 0, context_length, connections_granted=connections_granted):
-            return AssemblyResult(tool_defs=incoming + bridge_tool_schemas(0, connections_granted=connections_granted),
+            return AssemblyResult(tool_defs=incoming + bridge_tool_schemas(0, connections_granted=connections_granted,
+                                                                           compact=config.compact_bridge),
                                   activated=True, tier=2)
         return AssemblyResult(tool_defs=incoming, activated=False)
     deferrable_tokens = estimate_tokens_from_schemas(deferrable)
@@ -362,7 +427,7 @@ def assemble_tool_defs(tool_defs: List[Dict[str, Any]], *, context_length: Optio
         listing, listing_form = build_catalog_listing_with_form(
             deferrable, max_tokens=listing_budget)
     bridge = bridge_tool_schemas(len(deferrable), listing=listing, listing_form=listing_form,
-                                 connections_granted=connections_granted)
+                                 connections_granted=connections_granted, compact=config.compact_bridge)
     tier = 1 if listing_form in ("full", "names", "mixed") else 2
     logger.info(
         "tool_search activated (tier %d): %d core/visible tools kept, %d deferred "

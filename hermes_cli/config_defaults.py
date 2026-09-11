@@ -1817,10 +1817,11 @@ DEFAULT_CONFIG = {
         "memory_prompt_injection": False,
         # Context-file prose remains authoritative but is bounded independently of huge nominal model windows.
         "context_file_max_chars": 4000,
-        # Absolute working-set ceilings; short mode compacts around 8K to remain friendly to low-TPM free providers.
-        "short_context_ceiling": 8000,
-        "work_context_ceiling": 16000,
-        "autonomous_context_ceiling": 24000,
+        # Absolute long-session working-set ceilings. Fixed startup stays lean for free-provider eligibility;
+        # deterministic tool-result pruning controls churn long before summary compression is allowed to fire.
+        "short_context_ceiling": 32000,
+        "work_context_ceiling": 96000,
+        "autonomous_context_ceiling": 192000,
     },
 
     # Tool Search: deferrable tools are replaced in the model-facing array by

@@ -21,9 +21,9 @@ def test_lean_defaults_are_bounded():
     assert settings.background_review_enabled is False
     assert settings.memory_prompt_injection is False
     assert settings.context_file_max_chars == 4000
-    assert settings.short_context_ceiling == 8000
-    assert settings.work_context_ceiling == 16000
-    assert settings.autonomous_context_ceiling == 24000
+    assert settings.short_context_ceiling == 32000
+    assert settings.work_context_ceiling == 96000
+    assert settings.autonomous_context_ceiling == 192000
 
 
 def test_retention_cutoff_keeps_only_latest_tool_batch():

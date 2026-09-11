@@ -166,9 +166,9 @@ set_cfg token_economy.llm_title_upgrade false
 set_cfg token_economy.background_review_enabled false
 set_cfg token_economy.memory_prompt_injection false
 set_cfg token_economy.context_file_max_chars 4000
-set_cfg token_economy.short_context_ceiling 8000
-set_cfg token_economy.work_context_ceiling 16000
-set_cfg token_economy.autonomous_context_ceiling 24000
+set_cfg token_economy.short_context_ceiling 32000
+set_cfg token_economy.work_context_ceiling 96000
+set_cfg token_economy.autonomous_context_ceiling 192000
 
 # Verify the persisted token-economy settings and the effective runtime tool projection
 # without printing unrelated config or secrets.
@@ -184,8 +184,8 @@ expected = {
     "task_state_enabled": True, "task_state_projection_chars": 900,
     "compact_prompt": True, "llm_title_upgrade": False, "background_review_enabled": False,
     "memory_prompt_injection": False,
-    "context_file_max_chars": 4000, "short_context_ceiling": 8000,
-    "work_context_ceiling": 16000, "autonomous_context_ceiling": 24000,
+    "context_file_max_chars": 4000, "short_context_ceiling": 32000,
+    "work_context_ceiling": 96000, "autonomous_context_ceiling": 192000,
 }
 for key, value in expected.items():
     assert te.get(key) == value, (key, te.get(key), value)

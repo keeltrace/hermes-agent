@@ -39,9 +39,9 @@ class TokenEconomySettings:
     background_review_enabled: bool = False
     memory_prompt_injection: bool = False
     context_file_max_chars: int = 4000
-    short_context_ceiling: int = 8000
-    work_context_ceiling: int = 16000
-    autonomous_context_ceiling: int = 24000
+    short_context_ceiling: int = 32000
+    work_context_ceiling: int = 96000
+    autonomous_context_ceiling: int = 192000
 
     @classmethod
     def from_raw(cls, raw: Any) -> "TokenEconomySettings":
@@ -75,9 +75,9 @@ class TokenEconomySettings:
             background_review_enabled=flag("background_review_enabled", False),
             memory_prompt_injection=flag("memory_prompt_injection", False),
             context_file_max_chars=num("context_file_max_chars", 4000, 2000, 100000),
-            short_context_ceiling=num("short_context_ceiling", 8000, 8000, 1_000_000),
-            work_context_ceiling=num("work_context_ceiling", 16000, 8000, 1_000_000),
-            autonomous_context_ceiling=num("autonomous_context_ceiling", 24000, 8000, 1_000_000),
+            short_context_ceiling=num("short_context_ceiling", 32000, 8000, 1_000_000),
+            work_context_ceiling=num("work_context_ceiling", 96000, 8000, 1_000_000),
+            autonomous_context_ceiling=num("autonomous_context_ceiling", 192000, 8000, 1_000_000),
         )
 
 

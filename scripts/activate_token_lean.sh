@@ -235,17 +235,26 @@ def row(d):
 
 b, s, w = row(base), row(short), row(work)
 reduction = (1.0 - s["fixed_tokens"] / b["fixed_tokens"]) if b["fixed_tokens"] else 0.0
-short_expected_tools = {"clarify", "tool_search", "tool_describe", "tool_call"}
-work_expected_tools = {"terminal", "read_file", "write_file", "patch", "search_files", "clarify",
-                       "tool_search", "tool_describe", "tool_call"}
+
+# Respect the operator's actual tool availability. Token economy may compact/defer
+# tools, but it must never invent a direct tool the stock profile does not expose.
+# The three bridge tools are the only always-required additions. This keeps the
+# gate strict for leakage while allowing profiles that intentionally disable a
+# direct affordance such as `clarify`.
+baseline_tools = set(b["tool_names"])
+bridge_tools = {"tool_search", "tool_describe", "tool_call"}
+short_direct_candidates = {"clarify"}
+work_direct_candidates = {"terminal", "read_file", "write_file", "patch", "search_files", "clarify"}
+short_expected_tools = bridge_tools | (short_direct_candidates & baseline_tools)
+work_expected_tools = bridge_tools | (work_direct_candidates & baseline_tools)
 checks = {
     "short_fixed_le_5000": s["fixed_tokens"] <= 5000,
     "short_tools_le_650": s["tool_tokens"] <= 650,
-    "short_tool_surface_exact": set(s["tool_names"]) == short_expected_tools and s["tool_count"] == 4,
+    "short_tool_surface_exact": set(s["tool_names"]) == short_expected_tools and s["tool_count"] == len(short_expected_tools),
     "short_skills_index_zero": s["skills_bytes"] == 0,
     "work_fixed_le_8000": w["fixed_tokens"] <= 8000,
     "work_tools_le_2500": w["tool_tokens"] <= 2500,
-    "work_tool_surface_exact": set(w["tool_names"]) == work_expected_tools and w["tool_count"] == 9,
+    "work_tool_surface_exact": set(w["tool_names"]) == work_expected_tools and w["tool_count"] == len(work_expected_tools),
     "work_skills_index_zero": w["skills_bytes"] == 0,
     "short_reduction_ge_60pct": reduction >= 0.60,
     "short_memory_projection_zero": s["memory_bytes"] == 0 and s["user_profile_bytes"] == 0,
@@ -255,6 +264,7 @@ report = {
     "branch": branch,
     "commit": commit,
     "baseline": b, "short": s, "work": w,
+    "expected_tool_names": {"short": sorted(short_expected_tools), "work": sorted(work_expected_tools)},
     "short_reduction_percent": round(reduction * 100.0, 2),
     "checks": checks,
 }
@@ -262,7 +272,9 @@ report_p.write_text(json.dumps(report, indent=2) + "\n")
 print("Token budget:")
 print(f"  baseline fixed : ~{b['fixed_tokens']:,} tok ({b['tool_tokens']:,} tool)")
 print(f"  short fixed    : ~{s['fixed_tokens']:,} tok ({s['tool_tokens']:,} tool), reduction={reduction*100:.1f}%")
+print(f"  short tools    : {', '.join(s['tool_names']) or '(none)'}")
 print(f"  work fixed     : ~{w['fixed_tokens']:,} tok ({w['tool_tokens']:,} tool)")
+print(f"  work tools     : {', '.join(w['tool_names']) or '(none)'}")
 for name, ok in checks.items(): print(f"  {'PASS' if ok else 'FAIL'} {name}")
 if not all(checks.values()):
     raise SystemExit("token budget regression gate failed")

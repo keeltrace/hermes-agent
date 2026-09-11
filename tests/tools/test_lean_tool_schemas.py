@@ -62,7 +62,9 @@ def test_unknown_parameters_keep_full_description():
 
 
 def test_unknown_tools_are_not_copied_or_rewritten():
-    original = _schema("clarify")
+    # Use a genuinely uncurated future/plugin tool. ``clarify`` is intentionally
+    # part of the lean direct waist and therefore should be copied/compacted.
+    original = _schema("future_unprofiled_tool")
     assert compact_direct_tool_schemas([original])[0] is original
 
 

@@ -74,10 +74,13 @@ printf 'Commit: %s\n' "$(git -C "$ROOT" rev-parse --short=12 HEAD)"
 printf 'Config backup: %s\n' "$BACKUP"
 
 # Keep the existing runtime extras/lazy-installed provider packages and add the
-# locked dev extra so the rollout is testable before a gateway restart. `uv sync`
-# is exact by default; --inexact is load-bearing here because activation must not
-# uninstall optional capabilities that are not selected by this verification run.
-UV_PROJECT_ENVIRONMENT="$ROOT/.venv" "$UV" sync --extra dev --locked --inexact
+# locked dev + Hindsight extras needed by this verifier's regression surface.
+# `uv sync` is exact by default; --inexact is load-bearing here because activation
+# must not uninstall optional capabilities that are not selected by this
+# verification run. Hindsight is explicit because the suite exercises its real
+# embedded-client/background-retain paths and security.allow_lazy_installs may be
+# false on production machines, so tests must not depend on a runtime lazy install.
+UV_PROJECT_ENVIRONMENT="$ROOT/.venv" "$UV" sync --extra dev --extra hindsight --locked --inexact
 PY="$ROOT/.venv/bin/python"
 HERMES="$ROOT/.venv/bin/hermes"
 [[ -x "$PY" && -x "$HERMES" ]] || fail "Hermes virtualenv is incomplete after uv sync"

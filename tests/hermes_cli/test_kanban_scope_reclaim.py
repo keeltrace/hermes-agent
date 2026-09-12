@@ -29,7 +29,7 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
 
-    def _running_task(self, task_id: str, *, pid: int = 4242, scope: str | None = None) -> int:
+    def _running_task(self, task_id: str, *, pid: int | None = 4242, scope: str | None = None) -> int:
         now = int(time.time()) - 60
         claim_lock = f"{kb._host_prefix()}test"
         self.conn.execute(
@@ -171,6 +171,201 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIsNone(info["scope_unit"])
         self.assertTrue(info["terminated"])
+
+
+    def test_max_runtime_live_worker_defer_keeps_original_claim(self) -> None:
+        scope = "hermes-worker-kanban-max-runtime-run-1.scope"
+        self._running_task("max-runtime", pid=656565, scope=scope)
+        self.conn.execute(
+            "UPDATE tasks SET max_runtime_seconds=1, started_at=? WHERE id='max-runtime'",
+            (int(time.time()) - 60,),
+        )
+        self.conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE task_id='max-runtime' AND ended_at IS NULL",
+            (int(time.time()) - 60,),
+        )
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            return_value={"terminated": False, "host_local": True, "termination_attempted": True, "scope_stopped": False, "scope_unit": scope},
+        ):
+            timed_out = kbd.enforce_max_runtime(self.conn)
+        self.assertEqual(timed_out, [])
+        row = self.conn.execute(
+            "SELECT status,claim_lock,claim_expires FROM tasks WHERE id='max-runtime'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertIsNotNone(row["claim_lock"])
+        self.assertGreater(row["claim_expires"], int(time.time()))
+
+    def test_manual_reclaim_never_stops_prespawn_scope_without_pid(self) -> None:
+        scope = "hermes-worker-kanban-prespawn-manual-run-1.scope"
+        run_id = self._running_task("prespawn-manual", pid=None, scope=scope)
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("pre-spawn reclaim must not stop an uncreated scope"),
+        ):
+            reclaimed = kb.reclaim_task(self.conn, "prespawn-manual", reason="operator")
+        self.assertFalse(reclaimed)
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_lock,claim_expires,worker_pid FROM tasks WHERE id='prespawn-manual'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertIsNotNone(row["claim_lock"])
+        self.assertGreater(row["claim_expires"], int(time.time()))
+        self.assertIsNone(row["worker_pid"])
+        event = self.conn.execute(
+            "SELECT kind,payload FROM task_events WHERE task_id='prespawn-manual' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(event["kind"], "reclaim_deferred")
+        self.assertIn("manual_reclaim_worker_identity_incomplete", event["payload"])
+
+    def test_ttl_reclaim_never_stops_prespawn_scope_without_pid(self) -> None:
+        scope = "hermes-worker-kanban-prespawn-ttl-run-1.scope"
+        run_id = self._running_task("prespawn-ttl", pid=None, scope=scope)
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("expired pre-spawn claim must retain ownership"),
+        ):
+            reclaimed = kb.release_stale_claims(self.conn)
+        self.assertEqual(reclaimed, 0)
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_expires,worker_pid FROM tasks WHERE id='prespawn-ttl'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertGreater(row["claim_expires"], int(time.time()))
+        self.assertIsNone(row["worker_pid"])
+
+    def test_heartbeat_stale_reclaim_never_stops_prespawn_scope_without_pid(self) -> None:
+        scope = "hermes-worker-kanban-prespawn-stale-run-1.scope"
+        run_id = self._running_task("prespawn-stale", pid=None, scope=scope)
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("stale detector must wait for PID publication"),
+        ):
+            reclaimed = kbd.detect_stale_running(self.conn, stale_timeout_seconds=1)
+        self.assertEqual(reclaimed, [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_expires,worker_pid FROM tasks WHERE id='prespawn-stale'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertGreater(row["claim_expires"], int(time.time()))
+        self.assertIsNone(row["worker_pid"])
+
+    def test_orphan_reconcile_repairs_expiry_but_retains_prespawn_owner(self) -> None:
+        scope = "hermes-worker-kanban-prespawn-orphan-run-1.scope"
+        run_id = self._running_task("prespawn-orphan", pid=None, scope=scope)
+        self.conn.execute(
+            "UPDATE tasks SET claim_expires=NULL WHERE id='prespawn-orphan'"
+        )
+        self.conn.execute(
+            "UPDATE task_runs SET claim_expires=NULL WHERE id=?", (run_id,)
+        )
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("orphan repair must not stop an uncreated scope"),
+        ):
+            reconciled = kbd.reconcile_orphaned_running(self.conn)
+        self.assertEqual(reconciled, [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_lock,claim_expires,worker_pid FROM tasks WHERE id='prespawn-orphan'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertIsNotNone(row["claim_lock"])
+        self.assertGreater(row["claim_expires"], int(time.time()))
+        self.assertIsNone(row["worker_pid"])
+
+
+    def test_manual_reclaim_refreshes_pid_published_during_defer_check(self) -> None:
+        scope = "hermes-worker-kanban-publish-race-run-1.scope"
+        self._running_task("publish-race", pid=None, scope=scope)
+        def publish_then_decline(conn, task_id, *, reason, now=None):
+            kbd._set_worker_pid(conn, task_id, 616161, scope_unit=scope)
+            return False
+
+        with patch.object(kb, "_defer_reclaim_for_unpublished_worker", side_effect=publish_then_decline), patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            return_value={"terminated": True, "host_local": True, "termination_attempted": True, "scope_stopped": True, "scope_unit": scope},
+        ) as terminate:
+            reclaimed = kb.reclaim_task(self.conn, "publish-race", reason="operator")
+        self.assertTrue(reclaimed)
+        terminate.assert_called_once()
+        self.assertEqual(terminate.call_args.args[0], 616161)
+        self.assertEqual(terminate.call_args.kwargs["scope_unit"], scope)
+        self.assertNotEqual(kb.get_task(self.conn, "publish-race").status, "running")
+
+    def test_ttl_reclaim_refreshes_pid_published_during_defer_check(self) -> None:
+        scope = "hermes-worker-kanban-ttl-publish-race-run-1.scope"
+        self._running_task("ttl-publish-race", pid=None, scope=scope)
+
+        def publish_then_decline(conn, task_id, *, reason, now=None):
+            kbd._set_worker_pid(conn, task_id, 626262, scope_unit=scope)
+            return False
+
+        with patch.object(kb, "_defer_reclaim_for_unpublished_worker", side_effect=publish_then_decline), patch.object(
+            kb, "_pid_alive", return_value=False
+        ), patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            return_value={"terminated": True, "host_local": True, "termination_attempted": True, "scope_stopped": True, "scope_unit": scope},
+        ) as terminate:
+            reclaimed = kb.release_stale_claims(self.conn)
+        self.assertEqual(reclaimed, 1)
+        terminate.assert_called_once()
+        self.assertEqual(terminate.call_args.args[0], 626262)
+        self.assertEqual(terminate.call_args.kwargs["scope_unit"], scope)
+
+    def test_manual_reclaim_scope_drift_after_stop_proof_retains_owner(self) -> None:
+        scope = "hermes-worker-kanban-manual-drift-run-1.scope"
+        run_id = self._running_task("manual-drift", pid=636363, scope=scope)
+        replacement = scope.replace(".scope", "-replacement.scope")
+
+        def drift_then_report(*_args, **_kwargs):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?", (replacement, run_id)
+            )
+            return {"terminated": True, "host_local": True, "termination_attempted": True, "scope_stopped": True, "scope_unit": scope}
+
+        with patch.object(kb, "_terminate_reclaimed_worker", side_effect=drift_then_report):
+            reclaimed = kb.reclaim_task(self.conn, "manual-drift", reason="operator")
+        self.assertFalse(reclaimed)
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id='manual-drift'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 636363)
+        self.assertIsNotNone(row["claim_lock"])
+
+    def test_stale_reclaim_heartbeat_race_retains_owner(self) -> None:
+        scope = "hermes-worker-kanban-heartbeat-race-run-1.scope"
+        run_id = self._running_task("heartbeat-race", pid=646464, scope=scope)
+
+        def heartbeat_then_report(*_args, **_kwargs):
+            self.conn.execute(
+                "UPDATE tasks SET last_heartbeat_at=? WHERE id='heartbeat-race'", (int(time.time()),)
+            )
+            return {"terminated": True, "host_local": True, "termination_attempted": True, "scope_stopped": True, "scope_unit": scope}
+
+        with patch.object(kb, "_terminate_reclaimed_worker", side_effect=heartbeat_then_report):
+            reclaimed = kbd.detect_stale_running(self.conn, stale_timeout_seconds=1)
+        self.assertEqual(reclaimed, [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id='heartbeat-race'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 646464)
+        self.assertIsNotNone(row["claim_lock"])
 
 
 if __name__ == "__main__":

@@ -1928,6 +1928,91 @@ def _current_worker_scope_unit(conn: sqlite3.Connection, task_id: str) -> Option
     return str(value) if value else None
 
 
+def _running_worker_generation_row(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[sqlite3.Row]:
+    """Snapshot the exact active worker generation used by reclaim CAS checks."""
+    return conn.execute(
+        "SELECT t.id,t.status,t.current_run_id,t.worker_pid,t.claim_lock,t.claim_expires,"
+        "t.last_heartbeat_at,r.worker_scope_unit,"
+        "COALESCE(r.started_at,t.started_at) AS active_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+
+
+def _same_running_worker_generation(
+    current: Optional[sqlite3.Row], expected: sqlite3.Row
+) -> bool:
+    return bool(
+        current
+        and current["status"] == "running"
+        and current["current_run_id"] == expected["current_run_id"]
+        and current["worker_pid"] == expected["worker_pid"]
+        and current["claim_lock"] == expected["claim_lock"]
+        and current["worker_scope_unit"] == expected["worker_scope_unit"]
+    )
+
+
+def _defer_reclaim_for_unpublished_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Keep a running claim while its active run is still in the spawn window.
+
+    The default dispatcher persists the run's scope name *before* ``Popen`` and
+    publishes ``worker_pid`` only after spawn succeeds.  A reclaim in between
+    must not stop a not-yet-created scope and then release ownership while that
+    already-authorized spawn is still able to complete.  This helper CAS-checks
+    that the same active run still has no positive PID, extends its lease, and
+    records why reclaim was deferred.
+    """
+    observed = conn.execute(
+        "SELECT t.status,t.current_run_id,t.worker_pid,t.claim_lock,r.worker_scope_unit "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    if not observed or observed["status"] != "running" or not observed["current_run_id"]:
+        return False
+    try:
+        pid = int(observed["worker_pid"]) if observed["worker_pid"] is not None else 0
+    except (TypeError, ValueError):
+        pid = 0
+    if pid > 0:
+        return False
+    at = int(time.time()) if now is None else int(now)
+    grace = at + RECLAIM_DEFER_GRACE_SECONDS
+    run_id = int(observed["current_run_id"])
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=? AND status='running' "
+            "AND current_run_id=? AND (worker_pid IS NULL OR worker_pid <= 0) "
+            "AND claim_lock IS ?",
+            (grace, task_id, run_id, observed["claim_lock"]),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE task_runs SET claim_expires=? WHERE id=? AND ended_at IS NULL",
+            (grace, run_id),
+        )
+        _append_event(
+            conn, task_id, "reclaim_deferred",
+            {
+                "reason": reason,
+                "worker_pid": observed["worker_pid"],
+                "claim_lock": observed["claim_lock"],
+                "scope_unit": observed["worker_scope_unit"],
+                "claim_expires_now": grace,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
 def _end_or_synthesize_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, status: str,
     summary: Optional[str] = None, metadata: Optional[dict] = None, synthesize: bool,
@@ -2323,36 +2408,59 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
-        host_local = (row["claim_lock"] or "").startswith(host_prefix)
-        hb = row["last_heartbeat_at"]
+        if _defer_reclaim_for_unpublished_worker(
+            conn, row["id"], reason="ttl_expired_worker_identity_incomplete", now=now
+        ):
+            continue
+        generation = _running_worker_generation_row(conn, row["id"])
+        if (
+            generation is None
+            or generation["status"] != "running"
+            or generation["claim_lock"] != row["claim_lock"]
+            or generation["claim_expires"] != row["claim_expires"]
+            or generation["claim_expires"] is None
+            or int(generation["claim_expires"]) >= now
+        ):
+            continue
+        host_local = (generation["claim_lock"] or "").startswith(host_prefix)
+        hb = generation["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
-        if host_local and row["worker_pid"] and _pid_alive(row["worker_pid"]) and not heartbeat_stale:
-            _extend_live_stale_claim(conn, row, now)
+        if host_local and generation["worker_pid"] and _pid_alive(generation["worker_pid"]) and not heartbeat_stale:
+            _extend_live_stale_claim(conn, generation, now)
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"],
-            row["claim_lock"],
-            scope_unit=_current_worker_scope_unit(conn, row["id"]),
+            generation["worker_pid"],
+            generation["claim_lock"],
+            scope_unit=generation["worker_scope_unit"],
             signal_fn=signal_fn,
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
-                conn, row["id"], row["claim_lock"], now, termination,
+                conn, row["id"], generation["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
             )
             continue
         with write_txn(conn):
+            current = _running_worker_generation_row(conn, row["id"])
+            if (
+                not _same_running_worker_generation(current, generation)
+                or current["claim_expires"] != generation["claim_expires"]
+                or current["last_heartbeat_at"] != generation["last_heartbeat_at"]
+                or current["claim_expires"] is None
+                or int(current["claim_expires"]) >= now
+            ):
+                continue
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                (retry_status, row["id"], generation["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -2361,9 +2469,9 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
                 error=f"stale_lock={row['claim_lock']}",
                 payload={
                     "stale_lock": row["claim_lock"],
-                    "worker_pid": _opt_int(row["worker_pid"]),
-                    "claim_expires": int(row["claim_expires"]),
-                    "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
+                    "worker_pid": _opt_int(generation["worker_pid"]),
+                    "claim_expires": int(generation["claim_expires"]),
+                    "last_heartbeat_at": _opt_int(generation["last_heartbeat_at"]),
                     "now": now,
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
@@ -2375,7 +2483,7 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _fire_kanban_lifecycle_hook(
                 "on_kanban_worker_stale_claim", row["id"], board=get_current_board(),
-                assignee=row["assignee"], run_id=run_id, worker_pid=_opt_int(row["worker_pid"]),
+                assignee=row["assignee"], run_id=run_id, worker_pid=_opt_int(generation["worker_pid"]),
                 heartbeat_stale=bool(heartbeat_stale), retry_status=retry_status,
             )
     return reclaimed
@@ -2429,19 +2537,26 @@ def reclaim_task(
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
-    row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
+    row = _running_worker_generation_row(conn, task_id)
     if not row:
         return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    if row["status"] == "running" and _defer_reclaim_for_unpublished_worker(
+        conn, task_id, reason="manual_reclaim_worker_identity_incomplete"
+    ):
+        return False
+    if row["status"] == "running":
+        row = _running_worker_generation_row(conn, task_id)
+        if row is None or row["status"] != "running":
+            return False
+        prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"],
         prev_lock,
-        scope_unit=_current_worker_scope_unit(conn, task_id),
+        scope_unit=row["worker_scope_unit"],
         signal_fn=signal_fn,
     )
     # Manual reclaim is not permission to create a duplicate worker. If our
@@ -2459,6 +2574,10 @@ def reclaim_task(
             )
         return False
     with write_txn(conn):
+        if row["status"] == "running":
+            current = _running_worker_generation_row(conn, task_id)
+            if not _same_running_worker_generation(current, row):
+                return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "

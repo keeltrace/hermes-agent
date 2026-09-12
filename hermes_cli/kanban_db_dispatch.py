@@ -618,14 +618,32 @@ def detect_stale_running(
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue
 
-        pid = row["worker_pid"]
         tid = row["id"]
-        lock = row["claim_lock"] or ""
+        if _kb._defer_reclaim_for_unpublished_worker(
+            conn, tid, reason="heartbeat_stale_worker_identity_incomplete", now=now
+        ):
+            continue
+        generation = _kb._running_worker_generation_row(conn, tid)
+        if (
+            generation is None
+            or generation["status"] != "running"
+            or generation["active_started_at"] is None
+        ):
+            continue
+        elapsed = now - int(generation["active_started_at"])
+        if elapsed < stale_timeout_seconds:
+            continue
+        last_hb = generation["last_heartbeat_at"]
+        hb_age = (now - int(last_hb)) if last_hb is not None else None
+        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+            continue
+        pid = generation["worker_pid"]
+        lock = generation["claim_lock"] or ""
 
         termination = _kb._terminate_reclaimed_worker(
             pid,
             lock,
-            scope_unit=_kb._current_worker_scope_unit(conn, tid),
+            scope_unit=generation["worker_scope_unit"],
             signal_fn=signal_fn,
         )
 
@@ -639,6 +657,12 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
+            current = _kb._running_worker_generation_row(conn, tid)
+            if (
+                not _kb._same_running_worker_generation(current, generation)
+                or current["last_heartbeat_at"] != generation["last_heartbeat_at"]
+            ):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -696,7 +720,18 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     ).fetchall()
     for row in rows:
         tid = row["id"]
-        pid = row["worker_pid"]
+        if _kb._defer_reclaim_for_unpublished_worker(
+            conn, tid, reason="orphaned_running_worker_identity_incomplete", now=now
+        ):
+            continue
+        generation = _kb._running_worker_generation_row(conn, tid)
+        if (
+            generation is None
+            or generation["status"] != "running"
+            or not (generation["claim_lock"] is None or generation["claim_expires"] is None)
+        ):
+            continue
+        pid = generation["worker_pid"]
         if pid and _kb._pid_alive(pid):
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
@@ -706,34 +741,41 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             continue
         termination = _kb._terminate_reclaimed_worker(
             pid,
-            row["claim_lock"],
-            scope_unit=_kb._current_worker_scope_unit(conn, tid),
+            generation["claim_lock"],
+            scope_unit=generation["worker_scope_unit"],
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn,
                 tid,
-                row["claim_lock"],
+                generation["claim_lock"],
                 now,
                 termination,
                 reason="orphaned_running_scope_not_reaped",
             )
             continue
         with _kb.write_txn(conn):
+            current = _kb._running_worker_generation_row(conn, tid)
+            if (
+                not _kb._same_running_worker_generation(current, generation)
+                or current["claim_expires"] != generation["claim_expires"]
+                or not (current["claim_lock"] is None or current["claim_expires"] is None)
+            ):
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (tid, generation["claim_lock"], generation["claim_expires"]),
             )
             if cur.rowcount != 1:
                 continue
             payload = {
                 "reason": "orphaned_running",
-                "claim_lock": row["claim_lock"],
-                "claim_expires": _kb._opt_int(row["claim_expires"]),
+                "claim_lock": generation["claim_lock"],
+                "claim_expires": _kb._opt_int(generation["claim_expires"]),
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }

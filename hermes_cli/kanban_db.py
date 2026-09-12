@@ -2595,6 +2595,26 @@ def complete_task(
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
+    # A worker completing its own exact run (expected_run_id) may close it
+    # directly. An operator completing a running task must first prove the
+    # persisted worker scope is dead; otherwise clearing ownership here could
+    # make the task terminal beside a still-running worker tree.
+    if expected_run_id is None:
+        forced = _execute_forced_running_action(
+            conn,
+            task_id,
+            "complete",
+            {
+                "result": result,
+                "summary": summary,
+                "metadata": metadata,
+                "created_cards": verified_cards,
+                "fire_lifecycle_hook": bool(fire_lifecycle_hook),
+            },
+            author="complete_task",
+        )
+        if forced["state"] != "not_running":
+            return forced["state"] == "transitioned"
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -2614,12 +2634,16 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
+            sql += " AND status IN ('running', 'ready', 'blocked', 'review') AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        else:
+            # The forced-running helper just observed this task as non-running.
+            # Exclude running here as a second CAS boundary in case a dispatcher
+            # claimed it in the gap before this write transaction.
+            sql += " AND status IN ('ready', 'blocked', 'review')"
         if conn.execute(sql, params).rowcount != 1:
             return False
         if isinstance(metadata, dict):
@@ -2952,11 +2976,22 @@ def block_task(
     so a forever-flaky task escalates. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if expected_run_id is None:
+        forced = _execute_forced_running_action(
+            conn, task_id, "block", {"reason": reason, "kind": kind},
+            author="block_task",
+        )
+        if forced["state"] != "not_running":
+            return forced["state"] == "transitioned"
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
+            return False
+        if expected_run_id is None and cur_row["status"] == "running":
+            # Claimed after the forced-running preflight observed a non-running
+            # state. Never clear a newly acquired owner without scope proof.
             return False
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
@@ -2971,12 +3006,13 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
+            sql += " AND status IN ('running', 'ready') AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        else:
+            sql += " AND status = 'ready'"
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
@@ -3053,6 +3089,38 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    # ``force=True`` is an operator override, not permission to abandon a live
+    # worker tree. Resolve review provenance before termination, then route a
+    # running task through the same persisted-scope two-phase protocol used by
+    # other operator-forced structured transitions.
+    if expected_run_id is None and force:
+        if not _parents_satisfied(conn, task_id):
+            return _ret(False, "parent dependencies are not satisfied")
+        resolved_reviewer = reviewer
+        if resolved_reviewer is None:
+            resolved_reviewer = _prior_reviewer(conn, task_id)
+            if resolved_reviewer is False:
+                return _ret(
+                    False, "re-review has no durable reviewer provenance (the "
+                    "latest changes_requested event is missing or malformed); pass reviewer= explicitly",
+                )
+        resolved_reviewer = _canonical_assignee(resolved_reviewer)
+        forced = _execute_forced_running_action(
+            conn,
+            task_id,
+            "request_review",
+            {
+                "summary": summary,
+                "metadata": metadata,
+                "reviewer": resolved_reviewer,
+            },
+            author="request_review(force=True)",
+        )
+        if forced["state"] != "not_running":
+            if forced["state"] == "transitioned":
+                return _ret(True)
+            return _ret(False, "running worker scope could not be safely terminated")
+        reviewer = resolved_reviewer
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -3062,18 +3130,14 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
-        # Refuse to clear a live worker's claim without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True).
-        if (
-            expected_run_id is None
-            and not force
-            and trow["status"] == "running"
-            and trow["claim_lock"] is not None
-        ):
+        # Any unowned running row reaching this transaction was claimed after
+        # the operator preflight (or force=False refused to reap it). Never let
+        # a stale UI/CLI observation clear that newly acquired owner.
+        if expected_run_id is None and trow["status"] == "running":
             return _ret(
                 False, "task is running under a live claim; pass expected_run_id "
-                "(worker ownership) or force=True (explicit operator "
-                "override) instead of clearing the live run's claim",
+                "(worker ownership) or retry force=True so the exact persisted "
+                "worker scope can be terminated first",
             )
         implementer = trow["assignee"]
         if reviewer is None:
@@ -3478,6 +3542,303 @@ def _finalize_descendant_invalidation_after_termination(
         return {"state": "invalidated", "id": task_id, "entry": entry, "termination": termination}
 
 
+
+_FORCED_RUNNING_ACTIONS = frozenset({"complete", "block", "request_review", "archive", "schedule"})
+_FORCED_RUNNING_LIFECYCLE = frozenset({
+    "forced_running_transition_pending",
+    "forced_running_transition_deferred",
+    "forced_running_transition_completed",
+    "forced_running_transition_stale",
+})
+
+
+def _forced_running_owner_row(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT t.status,t.current_run_id,t.worker_pid,t.claim_lock,
+               r.worker_scope_unit
+        FROM tasks t
+        LEFT JOIN task_runs r ON r.id=t.current_run_id
+        WHERE t.id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+
+
+def _forced_running_owner_matches(row: Optional[sqlite3.Row], plan: dict[str, Any]) -> bool:
+    return bool(
+        row
+        and row["status"] == "running"
+        and row["current_run_id"] == plan.get("run_id")
+        and row["worker_pid"] == plan.get("worker_pid")
+        and row["claim_lock"] == plan.get("claim_lock")
+        and row["worker_scope_unit"] == plan.get("scope_unit")
+    )
+
+
+def _prepare_forced_running_action(
+    conn: sqlite3.Connection,
+    task_id: str,
+    action: str,
+    arguments: Optional[dict[str, Any]] = None,
+    *,
+    author: str = "operator",
+) -> dict[str, Any]:
+    """Persist operator intent before terminating a running task's worker tree.
+
+    The task deliberately remains ``running`` and retains its exact run/PID/claim
+    owner. That makes both crash windows restart-safe: a dispatcher cannot spawn a
+    replacement while the old scope may still exist, and recovery can bind the
+    pending action to one exact run generation.
+    """
+    if action not in _FORCED_RUNNING_ACTIONS:
+        raise ValueError(f"unsupported forced running action: {action}")
+    args = dict(arguments or {})
+    with write_txn(conn):
+        row = _forced_running_owner_row(conn, task_id)
+        if row is None or row["status"] != "running":
+            return {"state": "not_running", "id": task_id, "action": action}
+        run_id = row["current_run_id"]
+        scope_unit = str(row["worker_scope_unit"] or "").strip()
+        plan = {
+            "id": task_id,
+            "action": action,
+            "arguments": args,
+            "run_id": run_id,
+            "worker_pid": row["worker_pid"],
+            "claim_lock": row["claim_lock"],
+            "scope_unit": scope_unit or None,
+            "author": author,
+        }
+        if not run_id:
+            _append_event(
+                conn,
+                task_id,
+                "forced_running_transition_deferred",
+                {**plan, "reason": "running_task_missing_current_run"},
+            )
+            return {**plan, "state": "deferred"}
+        if not row["claim_lock"] or not row["worker_pid"] or int(row["worker_pid"]) <= 0:
+            # A scope name is persisted before systemd-run spawns the wrapper.
+            # Treat that pre-spawn window as owned/in-flight: stopping a unit
+            # before it exists and then releasing the claim could race the
+            # already-authorized spawn and create an orphan worker.
+            _append_event(
+                conn,
+                task_id,
+                "forced_running_transition_deferred",
+                {**plan, "reason": "worker_identity_incomplete"},
+                run_id=run_id,
+            )
+            return {**plan, "state": "deferred"}
+        if not scope_unit:
+            _append_event(
+                conn,
+                task_id,
+                "forced_running_transition_deferred",
+                {**plan, "reason": "worker_scope_missing"},
+                run_id=run_id,
+            )
+            return {**plan, "state": "deferred"}
+        _append_event(
+            conn,
+            task_id,
+            "forced_running_transition_pending",
+            plan,
+            run_id=run_id,
+        )
+        return {**plan, "state": "pending"}
+
+
+def _forced_running_scope_proven(plan: dict[str, Any], termination: dict[str, Any]) -> bool:
+    scope_unit = str(plan.get("scope_unit") or "").strip()
+    return bool(
+        scope_unit
+        and termination.get("terminated")
+        and termination.get("scope_stopped")
+        and termination.get("scope_unit") == scope_unit
+    )
+
+
+def _append_forced_running_outcome(
+    conn: sqlite3.Connection,
+    plan: dict[str, Any],
+    kind: str,
+    *,
+    reason: Optional[str] = None,
+    termination: Optional[dict[str, Any]] = None,
+    recovered: bool = False,
+) -> None:
+    payload: dict[str, Any] = {
+        "action": plan.get("action"),
+        "arguments": plan.get("arguments") or {},
+        "worker_pid": plan.get("worker_pid"),
+        "claim_lock": plan.get("claim_lock"),
+        "scope_unit": plan.get("scope_unit"),
+        "author": plan.get("author") or "operator",
+        "recovered": bool(recovered),
+    }
+    if reason:
+        payload["reason"] = reason
+    if termination is not None:
+        payload["termination"] = termination
+    _append_event(conn, str(plan["id"]), kind, payload, run_id=plan.get("run_id"))
+
+
+def _invoke_forced_running_action(conn: sqlite3.Connection, plan: dict[str, Any]) -> bool:
+    """Apply a proven-dead operator transition through the normal domain mutator.
+
+    Passing ``expected_run_id`` intentionally selects the worker-owned/CAS path:
+    the old scope is already dead, so the mutator may atomically close exactly
+    that run without re-entering the operator termination protocol.
+    """
+    action = str(plan.get("action") or "")
+    args = dict(plan.get("arguments") or {})
+    run_id = int(plan["run_id"])
+    task_id = str(plan["id"])
+    if action == "complete":
+        return bool(complete_task(
+            conn,
+            task_id,
+            result=args.get("result"),
+            summary=args.get("summary"),
+            metadata=args.get("metadata"),
+            created_cards=args.get("created_cards"),
+            expected_run_id=run_id,
+            fire_lifecycle_hook=bool(args.get("fire_lifecycle_hook", True)),
+        ))
+    if action == "block":
+        return bool(block_task(
+            conn,
+            task_id,
+            reason=args.get("reason"),
+            kind=args.get("kind"),
+            expected_run_id=run_id,
+        ))
+    if action == "request_review":
+        return bool(request_review(
+            conn,
+            task_id,
+            summary=args.get("summary"),
+            metadata=args.get("metadata"),
+            reviewer=args.get("reviewer"),
+            expected_run_id=run_id,
+            force=False,
+            with_reason=False,
+        ))
+    if action == "archive":
+        return bool(archive_task(conn, task_id, expected_run_id=run_id))
+    if action == "schedule":
+        return bool(schedule_task(
+            conn,
+            task_id,
+            reason=args.get("reason"),
+            expected_run_id=run_id,
+        ))
+    raise ValueError(f"unsupported forced running action: {action}")
+
+
+def _resume_forced_running_action_after_termination(
+    conn: sqlite3.Connection,
+    plan: dict[str, Any],
+    termination: dict[str, Any],
+    *,
+    recovered: bool = False,
+) -> dict[str, Any]:
+    """CAS-check exact ownership, then finish a pending structured transition."""
+    task_id = str(plan["id"])
+    if not _forced_running_scope_proven(plan, termination):
+        with write_txn(conn):
+            _append_forced_running_outcome(
+                conn,
+                plan,
+                "forced_running_transition_deferred",
+                reason="worker_scope_termination_unproven",
+                termination=termination,
+                recovered=recovered,
+            )
+        return {"state": "deferred", "id": task_id, "action": plan.get("action")}
+
+    with write_txn(conn):
+        row = _forced_running_owner_row(conn, task_id)
+        if not _forced_running_owner_matches(row, plan):
+            _append_forced_running_outcome(
+                conn,
+                plan,
+                "forced_running_transition_stale",
+                reason="ownership_changed_after_termination",
+                termination=termination,
+                recovered=recovered,
+            )
+            return {"state": "stale", "id": task_id, "action": plan.get("action")}
+
+    try:
+        ok = _invoke_forced_running_action(conn, plan)
+    except Exception as exc:
+        with write_txn(conn):
+            _append_forced_running_outcome(
+                conn,
+                plan,
+                "forced_running_transition_deferred",
+                reason=f"action_exception:{type(exc).__name__}:{str(exc)[:180]}",
+                termination=termination,
+                recovered=recovered,
+            )
+        if recovered:
+            return {"state": "deferred", "id": task_id, "action": plan.get("action")}
+        raise
+
+    if ok:
+        with write_txn(conn):
+            _append_forced_running_outcome(
+                conn,
+                plan,
+                "forced_running_transition_completed",
+                termination=termination,
+                recovered=recovered,
+            )
+        return {"state": "transitioned", "id": task_id, "action": plan.get("action")}
+
+    with write_txn(conn):
+        row = _forced_running_owner_row(conn, task_id)
+        reason = (
+            "ownership_changed_before_action_finalize"
+            if not _forced_running_owner_matches(row, plan)
+            else "action_finalize_refused"
+        )
+        _append_forced_running_outcome(
+            conn,
+            plan,
+            "forced_running_transition_stale" if reason.startswith("ownership_changed") else "forced_running_transition_deferred",
+            reason=reason,
+            termination=termination,
+            recovered=recovered,
+        )
+    return {"state": "stale" if reason.startswith("ownership_changed") else "deferred", "id": task_id, "action": plan.get("action")}
+
+
+def _execute_forced_running_action(
+    conn: sqlite3.Connection,
+    task_id: str,
+    action: str,
+    arguments: Optional[dict[str, Any]] = None,
+    *,
+    author: str = "operator",
+) -> dict[str, Any]:
+    plan = _prepare_forced_running_action(
+        conn, task_id, action, arguments, author=author
+    )
+    if plan["state"] != "pending":
+        return plan
+    termination = _terminate_reclaimed_worker(
+        plan.get("worker_pid"),
+        plan.get("claim_lock"),
+        scope_unit=plan.get("scope_unit"),
+    )
+    return _resume_forced_running_action_after_termination(
+        conn, plan, termination, recovered=False
+    )
+
 def _finalize_direct_status_transition_after_termination(
     conn: sqlite3.Connection,
     plan: dict[str, Any],
@@ -3878,13 +4239,29 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: Optional[int] = None,
+) -> bool:
+    if expected_run_id is None:
+        forced = _execute_forced_running_action(
+            conn, task_id, "archive", {}, author="archive_task"
         )
+        if forced["state"] != "not_running":
+            return forced["state"] == "transitioned"
+    with write_txn(conn):
+        if expected_run_id is not None:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'archived', "
+                "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (task_id, int(expected_run_id)),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'archived', "
+                "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status NOT IN ('archived', 'running')", (task_id,),
+            )
         if cur.rowcount != 1:
             return False
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
@@ -3935,6 +4312,12 @@ def schedule_task(
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
+    if expected_run_id is None:
+        forced = _execute_forced_running_action(
+            conn, task_id, "schedule", {"reason": reason}, author="schedule_task"
+        )
+        if forced["state"] != "not_running":
+            return forced["state"] == "transitioned"
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -3944,11 +4327,12 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
         """
         if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
+            sql += " AND status IN ('todo', 'ready', 'running', 'blocked') AND current_run_id = ?"
             params.append(int(expected_run_id))
+        else:
+            sql += " AND status IN ('todo', 'ready', 'blocked')"
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(

@@ -1782,6 +1782,104 @@ def _apply_default_assignee(
     return True
 
 
+
+def _reconcile_pending_forced_running_transitions(conn: sqlite3.Connection) -> list[str]:
+    """Resume operator-forced structured transitions after either crash window.
+
+    The pending event binds the action and its arguments to one exact
+    run/PID/claim/scope generation. We never stop a changed owner and never use
+    PID-only proof when the persisted scope is absent.
+    """
+    now = int(time.time())
+    lifecycle = (
+        "forced_running_transition_pending",
+        "forced_running_transition_deferred",
+        "forced_running_transition_completed",
+        "forced_running_transition_stale",
+    )
+    placeholders = ",".join("?" for _ in lifecycle)
+    rows = conn.execute(
+        f"""
+        SELECT e.id AS event_id,e.task_id,e.run_id,e.kind,e.payload,e.created_at,
+               t.worker_pid,t.claim_lock,r.worker_scope_unit
+        FROM task_events e
+        JOIN tasks t ON t.id=e.task_id
+        LEFT JOIN task_runs r ON r.id=t.current_run_id
+        WHERE e.kind IN ({placeholders})
+          AND e.id=(
+              SELECT MAX(x.id) FROM task_events x
+              WHERE x.task_id=e.task_id AND x.kind IN ({placeholders})
+          )
+          AND t.status='running' AND t.current_run_id=e.run_id
+        ORDER BY e.id
+        """,
+        (*lifecycle, *lifecycle),
+    ).fetchall()
+    finalized: list[str] = []
+    for row in rows:
+        if row["kind"] == "forced_running_transition_deferred" and (
+            now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
+        ):
+            continue
+        if row["kind"] not in {
+            "forced_running_transition_pending",
+            "forced_running_transition_deferred",
+        }:
+            continue
+        payload = _kb._json_dict(row["payload"])
+        action = str(payload.get("action") or "")
+        if action not in _kb._FORCED_RUNNING_ACTIONS:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn,
+                    row["task_id"],
+                    "forced_running_transition_stale",
+                    {"reason": "invalid_or_missing_action", "action": action or None},
+                    run_id=row["run_id"],
+                )
+            continue
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+        plan = {
+            "id": row["task_id"],
+            "action": action,
+            "arguments": arguments,
+            "run_id": row["run_id"],
+            "worker_pid": payload.get("worker_pid"),
+            "claim_lock": payload.get("claim_lock"),
+            "scope_unit": payload.get("scope_unit"),
+            "author": payload.get("author") or "dispatcher-recovery",
+        }
+        exact_owner = bool(
+            row["worker_pid"] == plan["worker_pid"]
+            and row["claim_lock"] == plan["claim_lock"]
+            and row["worker_scope_unit"] == plan["scope_unit"]
+        )
+        if not exact_owner:
+            with _kb.write_txn(conn):
+                _kb._append_forced_running_outcome(
+                    conn,
+                    plan,
+                    "forced_running_transition_stale",
+                    reason="ownership_changed_before_reconcile",
+                    recovered=True,
+                )
+            continue
+        if not str(plan["scope_unit"] or "").strip():
+            continue
+        termination = _kb._terminate_reclaimed_worker(
+            plan["worker_pid"],
+            plan["claim_lock"],
+            scope_unit=plan["scope_unit"],
+        )
+        outcome = _kb._resume_forced_running_action_after_termination(
+            conn, plan, termination, recovered=True
+        )
+        if outcome["state"] == "transitioned":
+            finalized.append(str(row["task_id"]))
+    return finalized
+
 def _reconcile_pending_direct_status_transitions(conn: sqlite3.Connection) -> list[str]:
     """Resume dashboard running-status transitions after a process crash.
 
@@ -1964,6 +2062,7 @@ def _run_reclaim_phase(
     reconcile_orphans: bool,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    _reconcile_pending_forced_running_transitions(conn)
     _reconcile_pending_direct_status_transitions(conn)
     _reconcile_pending_descendant_invalidations(conn)
     reap_worker_zombies()

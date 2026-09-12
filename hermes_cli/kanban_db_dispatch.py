@@ -617,7 +617,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": bool(termination.get("sigkill")),
                     "retry_status": retry_status,
                 },
-                require_unclaimed=True,
+                protect_active_replacement=True,
             )
     return timed_out
 
@@ -1154,7 +1154,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 },
-                require_unclaimed=True,
+                protect_active_replacement=True,
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
@@ -1166,7 +1166,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
-                require_unclaimed=True,
+                protect_active_replacement=True,
             )
         if tripped:
             auto_blocked.append(tid)
@@ -1233,7 +1233,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
-    require_unclaimed: bool = False,
+    protect_active_replacement: bool = False,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1247,7 +1247,7 @@ def _record_task_failure(
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
 
-    ``require_unclaimed=True`` is for post-reclaim timeout/crash accounting.
+    ``protect_active_replacement=True`` is for post-reclaim timeout/crash accounting.
     Those callers already ended the failed run and released ownership in a
     prior transaction; if a replacement run has been claimed meanwhile, the
     stale failure must not increment, block, or annotate that new generation.
@@ -1264,8 +1264,11 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
-        if require_unclaimed and row["current_run_id"] is not None:
-            return False
+        active_replacement_run_id = (
+            row["current_run_id"]
+            if protect_active_replacement and row["current_run_id"] is not None
+            else None
+        )
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1307,6 +1310,30 @@ def _record_task_failure(
                     {"error": error, "failures": failures, "retry_status": retry_status},
                     run_id=run_id,
                 )
+            return False
+
+        if active_replacement_run_id is not None:
+            # The old attempt crossed the breaker threshold only after a newer
+            # run had already acquired ownership. Preserve the task-level
+            # failure count, but never block/clear/signal the replacement from
+            # stale accounting. A later success resets the count; a later
+            # failure can trip the breaker after that generation releases.
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND current_run_id = ?",
+                (failures, error, task_id, active_replacement_run_id),
+            )
+            payload = {
+                "failures": failures,
+                "effective_limit": effective_limit,
+                "limit_source": limit_source,
+                "error": error,
+                "trigger_outcome": outcome,
+                "active_run_id": active_replacement_run_id,
+            }
+            if event_payload_extra:
+                payload.update(event_payload_extra)
+            _kb._append_event(conn, task_id, "breaker_deferred", payload)
             return False
 
         # Spawn path (release_claim) is still running and also clears claim

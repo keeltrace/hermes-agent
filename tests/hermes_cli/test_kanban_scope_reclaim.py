@@ -577,7 +577,7 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
         self.assertTrue(row["claim_lock"].endswith("replacement"))
 
 
-    def test_post_reclaim_failure_accounting_never_mutates_replacement_run(self) -> None:
+    def test_post_reclaim_failure_accounting_counts_but_never_blocks_replacement_run(self) -> None:
         scope = "hermes-worker-kanban-accounting-replacement-run-1.scope"
         old_run = self._running_task("accounting-replacement", pid=808080, scope=scope)
         # Model the state immediately after the old run was reclaimed.
@@ -622,7 +622,7 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
                 "old generation crashed",
                 outcome="crashed",
                 force_trip=True,
-                require_unclaimed=True,
+                protect_active_replacement=True,
             )
         )
         row = self.conn.execute(
@@ -633,8 +633,14 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
         self.assertEqual(row["current_run_id"], replacement_run)
         self.assertEqual(row["worker_pid"], 818181)
         self.assertEqual(row["claim_lock"], replacement_claim)
-        self.assertEqual(row["consecutive_failures"], 0)
-        self.assertIsNone(row["last_failure_error"])
+        self.assertEqual(row["consecutive_failures"], 1)
+        self.assertEqual(row["last_failure_error"], "old generation crashed")
+        event = self.conn.execute(
+            "SELECT kind,payload,run_id FROM task_events WHERE task_id='accounting-replacement' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(event["kind"], "breaker_deferred")
+        self.assertIsNone(event["run_id"])
+        self.assertIn(str(replacement_run), event["payload"])
 
 
 if __name__ == "__main__":

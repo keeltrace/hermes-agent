@@ -2504,21 +2504,48 @@ def _record_reclaim(
 
 
 def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
-    """TTL-expired claim whose host-local worker is alive: extend instead of
-    reclaiming (``claim_extended`` event). CAS on the same expired lock so a
-    concurrent reclaimer wins cleanly."""
+    """Extend only the exact live worker generation that was inspected.
+
+    Claim tokens are host/claimer identities and can be reused across runs. A
+    stale TTL scan must therefore bind its lease extension to run/PID/claim/
+    scope/start plus the original expiry and heartbeat, not merely to the claim
+    token. The re-read and both task/run updates happen under one write txn.
+    """
     new_expires = now + _resolve_claim_ttl_seconds()
     with write_txn(conn):
+        current = _running_worker_generation_row(conn, row["id"])
+        if (
+            not _same_running_worker_generation(current, row)
+            or current["active_started_at"] != row["active_started_at"]
+            or current["claim_expires"] != row["claim_expires"]
+            or current["last_heartbeat_at"] != row["last_heartbeat_at"]
+            or current["claim_expires"] is None
+            or int(current["claim_expires"]) >= now
+        ):
+            return
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' "
-            "  AND claim_lock IS ? "
-            "  AND claim_expires IS NOT NULL "
-            "  AND claim_expires < ?", (new_expires, row["id"], row["claim_lock"], now),
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "  AND worker_pid IS ? AND claim_lock IS ? "
+            "  AND claim_expires IS ? AND last_heartbeat_at IS ?",
+            (
+                new_expires, row["id"], row["current_run_id"],
+                row["worker_pid"], row["claim_lock"], row["claim_expires"],
+                row["last_heartbeat_at"],
+            ),
         )
         if cur.rowcount != 1:
             return
-        run_id = _extend_run_claim(conn, row["id"], new_expires)
+        run_id = row["current_run_id"]
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ? AND task_id = ? "
+                "AND worker_pid IS ? AND claim_lock IS ? AND worker_scope_unit IS ?",
+                (
+                    new_expires, run_id, row["id"], row["worker_pid"],
+                    row["claim_lock"], row["worker_scope_unit"],
+                ),
+            )
         _append_event(
             conn, row["id"], "claim_extended",
             {
@@ -2528,6 +2555,7 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
                 "claim_expires_was": int(row["claim_expires"]),
                 "claim_expires_now": new_expires,
                 "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
+                "worker_scope_unit": row["worker_scope_unit"],
             },
             run_id=run_id,
         )

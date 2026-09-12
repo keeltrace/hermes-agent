@@ -699,5 +699,90 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
         self.assertEqual(after_events, before_events)
 
 
+    def test_live_stale_claim_extension_updates_exact_task_and_run(self) -> None:
+        scope = "hermes-worker-kanban-live-stale-run-1.scope"
+        run_id = self._running_task("live-stale", pid=848484, scope=scope)
+        generation = kb._running_worker_generation_row(self.conn, "live-stale")
+        self.assertIsNotNone(generation)
+        old_expires = generation["claim_expires"]
+        now = int(time.time())
+
+        kb._extend_live_stale_claim(self.conn, generation, now)
+
+        task = self.conn.execute(
+            "SELECT current_run_id,worker_pid,claim_expires FROM tasks WHERE id='live-stale'"
+        ).fetchone()
+        run = self.conn.execute(
+            "SELECT claim_expires,worker_pid,worker_scope_unit FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual(task["current_run_id"], run_id)
+        self.assertEqual(task["worker_pid"], 848484)
+        self.assertGreater(task["claim_expires"], old_expires)
+        self.assertEqual(run["claim_expires"], task["claim_expires"])
+        self.assertEqual(run["worker_pid"], 848484)
+        self.assertEqual(run["worker_scope_unit"], scope)
+        event = self.conn.execute(
+            "SELECT kind,run_id,payload FROM task_events WHERE task_id='live-stale' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(event["kind"], "claim_extended")
+        self.assertEqual(event["run_id"], run_id)
+        self.assertIn(scope, event["payload"])
+
+    def test_live_stale_claim_extension_cannot_extend_replacement_with_reused_claim(self) -> None:
+        old_scope = "hermes-worker-kanban-live-stale-old-run-1.scope"
+        old_run = self._running_task("live-stale-race", pid=858585, scope=old_scope)
+        old_generation = kb._running_worker_generation_row(self.conn, "live-stale-race")
+        self.assertIsNotNone(old_generation)
+        shared_claim = old_generation["claim_lock"]
+        now = int(time.time())
+        replacement_expiry = now + 45
+        replacement_scope = "hermes-worker-kanban-live-stale-new-run-2.scope"
+        cur = self.conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_scope_unit,started_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "live-stale-race",
+                "default",
+                "running",
+                shared_claim,
+                replacement_expiry,
+                868686,
+                replacement_scope,
+                now,
+            ),
+        )
+        replacement_run = int(cur.lastrowid)
+        self.conn.execute(
+            "UPDATE tasks SET current_run_id=?,worker_pid=?,claim_lock=?,claim_expires=?,started_at=? "
+            "WHERE id='live-stale-race'",
+            (replacement_run, 868686, shared_claim, replacement_expiry, now),
+        )
+        before_events = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id='live-stale-race' AND kind='claim_extended'"
+        ).fetchone()["n"]
+
+        kb._extend_live_stale_claim(self.conn, old_generation, now)
+
+        task = self.conn.execute(
+            "SELECT current_run_id,worker_pid,claim_expires FROM tasks WHERE id='live-stale-race'"
+        ).fetchone()
+        replacement = self.conn.execute(
+            "SELECT claim_expires,worker_pid,worker_scope_unit FROM task_runs WHERE id=?",
+            (replacement_run,),
+        ).fetchone()
+        self.assertEqual(task["current_run_id"], replacement_run)
+        self.assertNotEqual(task["current_run_id"], old_run)
+        self.assertEqual(task["worker_pid"], 868686)
+        self.assertEqual(task["claim_expires"], replacement_expiry)
+        self.assertEqual(replacement["claim_expires"], replacement_expiry)
+        self.assertEqual(replacement["worker_scope_unit"], replacement_scope)
+        after_events = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id='live-stale-race' AND kind='claim_extended'"
+        ).fetchone()["n"]
+        self.assertEqual(after_events, before_events)
+
+
 if __name__ == "__main__":
     unittest.main()

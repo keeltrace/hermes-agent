@@ -91,7 +91,7 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     assert result["terminations"] == []
 
 
-def test_running_descendant_event_precedes_termination_via_reclaim_helper(
+def test_running_descendant_intent_precedes_scope_termination_and_finalization(
     conn, tmp_path, monkeypatch,
 ):
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
@@ -101,21 +101,25 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
     claimed = kb.claim_task(conn, child_id)
     assert claimed is not None and claimed.status == "running"
-    kbd._set_worker_pid(conn, child_id, 424242)
+    kbd._set_worker_pid(
+        conn, child_id, 424242,
+        scope_unit=f"hermes-worker-kanban-{child_id}-run-{claimed.current_run_id}.scope",
+    )
 
     kills: list[tuple] = []
 
     def fake_terminate(pid, claim_lock, **kwargs):
-        # The audit trail must already be durable when the kill fires:
-        # standalone calls commit before terminating.
         side = kbc.connect(tmp_path / "kanban.db")
         try:
             kinds = [e.kind for e in kb.list_events(side, child_id)]
+            child = kb.get_task(side, child_id)
         finally:
             side.close()
-        assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock))
-        return {"terminated": True}
+        assert "descendant_invalidation_pending" in kinds
+        assert "descendant_invalidated" not in kinds
+        assert child is not None and child.status == "running"
+        kills.append((pid, claim_lock, kwargs.get("scope_unit")))
+        return {"terminated": True, "scope_unit": kwargs.get("scope_unit"), "scope_stopped": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
 
@@ -125,13 +129,47 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    assert kills[0][2] and kills[0][2].endswith(".scope")
+    assert result["terminations"][0]["worker_pid"] == 424242
     child = kb.get_task(conn, child_id)
     assert child is not None
     assert child.status == "todo"
     assert child.current_run_id is None
     run = kb.latest_run(conn, child_id)
     assert run is not None and run.outcome == "reclaimed"
+    kinds = [e.kind for e in kb.list_events(conn, child_id)]
+    assert "descendant_invalidation_pending" in kinds
+    assert "descendant_invalidated" in kinds
+
+
+def test_running_descendant_failed_scope_stop_retains_ownership(conn, monkeypatch):
+    parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    child_id = kb.create_task(conn, title="child", assignee="builder", parents=[parent_id])
+    claimed = kb.claim_task(conn, child_id)
+    assert claimed is not None
+    kbd._set_worker_pid(
+        conn, child_id, 515151,
+        scope_unit=f"hermes-worker-kanban-{child_id}-run-{claimed.current_run_id}.scope",
+    )
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: {"terminated": False, "scope_stop_attempted": True, "scope_stopped": False},
+    )
+
+    _reopen_parent_directly(conn, parent_id)
+    result = kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+
+    child = kb.get_task(conn, child_id)
+    assert child is not None and child.status == "running"
+    assert child.current_run_id == claimed.current_run_id
+    assert child.worker_pid == 515151
+    assert child.claim_lock
+    assert result["deferred"][0]["state"] == "deferred"
+    kinds = [e.kind for e in kb.list_events(conn, child_id)]
+    assert "descendant_invalidation_pending" in kinds
+    assert "descendant_invalidation_deferred" in kinds
+    assert "descendant_invalidated" not in kinds
 
 
 def test_counter_reset_on_invalidated_descendants(conn):

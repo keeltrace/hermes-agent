@@ -692,6 +692,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
     terminations: list[tuple[Optional[int], Optional[str]]] = []
+    descendant_terminations: list[dict[str, Any]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -730,9 +731,17 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
-            terminations.extend(result["terminations"])
+            descendant_terminations.extend(result["terminations"])
     for pid, claim_lock in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+    for plan in descendant_terminations:
+        termination = kanban_db._terminate_reclaimed_worker(
+            plan.get("worker_pid"), plan.get("claim_lock"),
+            scope_unit=plan.get("scope_unit"),
+        )
+        kanban_db._finalize_descendant_invalidation_after_termination(
+            conn, plan, termination, author="dashboard",
+        )
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)

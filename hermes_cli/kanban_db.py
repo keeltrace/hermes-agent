@@ -3375,29 +3375,126 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _finalize_descendant_invalidation_after_termination(
+    conn: sqlite3.Connection, plan: dict[str, Any], termination: dict[str, Any], *, author: str,
+) -> dict[str, Any]:
+    """Finalize a running descendant invalidation only after worker death is proven.
+
+    ``plan`` is created transactionally by
+    :func:`invalidate_descendants_for_parent_reopen`. The worker termination is
+    intentionally performed outside the SQLite write lock. This function then
+    re-enters a short transaction and CAS-checks the exact run ownership before
+    closing the run and releasing the claim. A failed or stale termination never
+    releases ownership.
+    """
+    task_id = str(plan["id"])
+    ancestor = str(plan["ancestor"])
+    expected_run_id = plan.get("run_id")
+    expected_pid = plan.get("worker_pid")
+    expected_lock = plan.get("claim_lock")
+    resume_status = str(plan.get("resume_status") or "ready")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        scope_unit = str(plan.get("scope_unit") or "").strip()
+        scope_proven = bool(
+            scope_unit
+            and termination.get("terminated")
+            and termination.get("scope_stopped")
+            and termination.get("scope_unit") == scope_unit
+        )
+        if not scope_proven:
+            _append_event(
+                conn, task_id, "descendant_invalidation_deferred",
+                {
+                    "ancestor": ancestor,
+                    "reason": "worker_scope_termination_unproven",
+                    "resume_status": resume_status,
+                    "worker_pid": expected_pid,
+                    "claim_lock": expected_lock,
+                    "scope_unit": scope_unit or None,
+                    "termination": termination,
+                },
+                run_id=expected_run_id,
+            )
+            return {"state": "deferred", "id": task_id, "termination": termination}
+
+        ownership_matches = bool(
+            row
+            and row["status"] == "running"
+            and row["current_run_id"] == expected_run_id
+            and row["worker_pid"] == expected_pid
+            and row["claim_lock"] == expected_lock
+        )
+        if not ownership_matches:
+            if row is not None:
+                _append_event(
+                    conn, task_id, "descendant_invalidation_stale",
+                    {
+                        "ancestor": ancestor,
+                        "reason": "ownership_changed_after_termination",
+                        "expected_run_id": expected_run_id,
+                        "current_run_id": row["current_run_id"],
+                    },
+                    run_id=row["current_run_id"],
+                )
+            return {"state": "stale", "id": task_id, "termination": termination}
+
+        run_id = _end_run(
+            conn, task_id, outcome="reclaimed", status="todo",
+            summary=f"ancestor {ancestor} reopened",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', completed_at = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
+            (task_id,),
+        )
+        entry = {
+            "id": task_id, "prior_status": "running",
+            "new_status": "todo", "resume_status": resume_status,
+        }
+        _append_event(
+            conn, task_id, "descendant_invalidated",
+            {"ancestor": ancestor, **{k: v for k, v in entry.items() if k != "id"}},
+            run_id=run_id,
+        )
+        _append_event(
+            conn, task_id, "status",
+            {
+                "status": "todo", "reason": "ancestor_reopened", "parent": ancestor,
+                "previous_status": "running", "resume_status": resume_status,
+            },
+            run_id=run_id,
+        )
+        _insert_comment(
+            conn, task_id, author, f"Invalidated: ancestor {ancestor} was reopened; "
+            f"retracted from 'running' to 'todo' (will resume via '{resume_status}').",
+            int(time.time()),
+        )
+        return {"state": "invalidated", "id": task_id, "entry": entry, "termination": termination}
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
 ) -> dict[str, Any]:
-    """THE done-reopen invalidation: every ``ready``/``review``/``running``/``done``
-    descendant of a reopened ancestor is demoted to ``todo`` and re-gated.
-    Every surface that reopens a done task (dashboard PATCH/drag) routes here.
+    """Retract descendants whose completed/running work depended on a reopened ancestor.
 
-    Composes under the caller's txn (``allow_nested=True``) so the flip and the
-    retractions commit atomically. Each descendant gets a
-    ``descendant_invalidated`` event, the legacy ``status`` event the live feed
-    renders, and a comment naming the ancestor. Running descendants are closed
-    ``reclaimed`` and their workers killed strictly post-commit (audit trail
-    before death) — when composed, the CALLER must drain ``terminations``
-    after its own commit. ``consecutive_failures`` resets (deliberate operator
-    action), the opposite of :func:`reopen_review_task`.
-
-    Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock)]}``.
+    Non-running descendants are demoted atomically with the caller. Running
+    descendants use a two-phase fail-closed protocol: first persist a termination
+    intent while retaining run ownership, then stop the persisted worker scope
+    outside the SQLite write lock, and only then CAS-finalize the demotion. When
+    composed inside a caller-owned transaction, the caller must execute and
+    finalize the returned ``terminations`` after commit.
     """
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    deferred: list[dict[str, Any]] = []
+    terminations: list[dict[str, Any]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -3408,9 +3505,11 @@ def invalidate_descendants_for_parent_reopen(
                 FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
+            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock,
+                   r.worker_scope_unit
             FROM descendants d
             JOIN tasks t ON t.id = d.id
+            LEFT JOIN task_runs r ON r.id = t.current_run_id
             ORDER BY t.id
             """,
             (task_id,),
@@ -3419,23 +3518,39 @@ def invalidate_descendants_for_parent_reopen(
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
-            resume_status = "ready"
-            run_id = None
-            if previous_status == "review":
-                resume_status = "review"
-            elif previous_status == "running":
+            resume_status = "review" if previous_status == "review" else "ready"
+            if previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
-                terminations.append((row["worker_pid"], row["claim_lock"]))
-                run_id = _end_run(
-                    conn, row["id"], outcome="reclaimed", status="todo",
-                    summary=f"ancestor {task_id} reopened",
+                plan = {
+                    "id": row["id"],
+                    "ancestor": task_id,
+                    "run_id": row["current_run_id"],
+                    "worker_pid": row["worker_pid"],
+                    "claim_lock": row["claim_lock"],
+                    "scope_unit": row["worker_scope_unit"],
+                    "resume_status": resume_status,
+                }
+                _append_event(
+                    conn, row["id"], "descendant_invalidation_pending",
+                    {
+                        "ancestor": task_id,
+                        "prior_status": "running",
+                        "new_status": "todo",
+                        "resume_status": resume_status,
+                        "worker_pid": row["worker_pid"],
+                        "claim_lock": row["claim_lock"],
+                        "scope_unit": row["worker_scope_unit"],
+                    },
+                    run_id=row["current_run_id"],
                 )
-            # consecutive_failures = 0: deliberate operator reset — see
-            # docstring for why this diverges from reopen_review_task.
+                terminations.append(plan)
+                continue
+
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
+                (row["id"],),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
@@ -3444,17 +3559,13 @@ def invalidate_descendants_for_parent_reopen(
             _append_event(
                 conn, row["id"], "descendant_invalidated",
                 {"ancestor": task_id, **{k: v for k, v in entry.items() if k != "id"}},
-                run_id=run_id,
             )
-            # Legacy 'status' event so existing live-feed consumers still see
-            # the move without learning the new event kind.
             _append_event(
                 conn, row["id"], "status",
                 {
                     "status": "todo", "reason": "ancestor_reopened", "parent": task_id,
                     "previous_status": previous_status, "resume_status": resume_status,
                 },
-                run_id=run_id,
             )
             _insert_comment(
                 conn, row["id"], author, f"Invalidated: ancestor {task_id} was reopened; "
@@ -3462,13 +3573,21 @@ def invalidate_descendants_for_parent_reopen(
                 f"(will resume via '{resume_status}').", now,
             )
             invalidated.append(entry)
-    if not caller_owns_txn:
-        # Standalone: committed above, audit trail durable, safe to kill now.
-        # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
-    return {"invalidated": invalidated, "terminations": terminations}
 
+    if not caller_owns_txn:
+        for plan in terminations:
+            termination = _terminate_reclaimed_worker(
+                plan.get("worker_pid"), plan.get("claim_lock"),
+                scope_unit=plan.get("scope_unit"),
+            )
+            outcome = _finalize_descendant_invalidation_after_termination(
+                conn, plan, termination, author=author,
+            )
+            if outcome["state"] == "invalidated":
+                invalidated.append(outcome["entry"])
+            else:
+                deferred.append(outcome)
+    return {"invalidated": invalidated, "terminations": terminations, "deferred": deferred}
 
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,

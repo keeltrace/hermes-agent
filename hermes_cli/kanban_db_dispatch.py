@@ -1782,6 +1782,88 @@ def _apply_default_assignee(
     return True
 
 
+def _reconcile_pending_descendant_invalidations(conn: sqlite3.Connection) -> list[str]:
+    """Resume ancestor-reopen worker termination after a caller/process crash.
+
+    The invalidation intent is durable before any systemd operation. A later
+    dispatcher tick reconstructs only the exact persisted owner, retries whole-
+    scope termination outside a write transaction, and lets the domain finalizer
+    release ownership only after scope death is proven. Failed attempts are
+    retried after the normal reclaim defer grace to avoid a tight systemctl loop.
+    """
+    now = int(time.time())
+    lifecycle = (
+        "descendant_invalidation_pending",
+        "descendant_invalidation_deferred",
+        "descendant_invalidated",
+        "descendant_invalidation_stale",
+    )
+    placeholders = ",".join("?" for _ in lifecycle)
+    rows = conn.execute(
+        f"""
+        SELECT e.id AS event_id,e.task_id,e.run_id,e.kind,e.payload,e.created_at,
+               t.worker_pid,t.claim_lock,r.worker_scope_unit
+        FROM task_events e
+        JOIN tasks t ON t.id=e.task_id
+        LEFT JOIN task_runs r ON r.id=t.current_run_id
+        WHERE e.kind IN ({placeholders})
+          AND e.id=(
+              SELECT MAX(x.id) FROM task_events x
+              WHERE x.task_id=e.task_id AND x.kind IN ({placeholders})
+          )
+          AND t.status='running' AND t.current_run_id=e.run_id
+        ORDER BY e.id
+        """,
+        (*lifecycle, *lifecycle),
+    ).fetchall()
+    finalized: list[str] = []
+    for row in rows:
+        if row["kind"] == "descendant_invalidation_deferred" and (
+            now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
+        ):
+            continue
+        if row["kind"] not in {"descendant_invalidation_pending", "descendant_invalidation_deferred"}:
+            continue
+        payload = _kb._json_dict(row["payload"])
+        plan = {
+            "id": row["task_id"],
+            "ancestor": payload.get("ancestor"),
+            "run_id": row["run_id"],
+            "worker_pid": payload.get("worker_pid"),
+            "claim_lock": payload.get("claim_lock"),
+            "scope_unit": payload.get("scope_unit"),
+            "resume_status": payload.get("resume_status") or "ready",
+        }
+        exact_owner = bool(
+            plan["ancestor"]
+            and row["worker_pid"] == plan["worker_pid"]
+            and row["claim_lock"] == plan["claim_lock"]
+            and row["worker_scope_unit"] == plan["scope_unit"]
+        )
+        if not exact_owner:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, row["task_id"], "descendant_invalidation_stale",
+                    {
+                        "ancestor": plan["ancestor"],
+                        "reason": "ownership_changed_before_reconcile",
+                        "expected_worker_pid": plan["worker_pid"],
+                        "current_worker_pid": row["worker_pid"],
+                    },
+                    run_id=row["run_id"],
+                )
+            continue
+        termination = _kb._terminate_reclaimed_worker(
+            plan["worker_pid"], plan["claim_lock"], scope_unit=plan["scope_unit"],
+        )
+        outcome = _kb._finalize_descendant_invalidation_after_termination(
+            conn, plan, termination, author="dispatcher-recovery",
+        )
+        if outcome["state"] == "invalidated":
+            finalized.append(str(row["task_id"]))
+    return finalized
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -1791,6 +1873,7 @@ def _run_reclaim_phase(
     reconcile_orphans: bool,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    _reconcile_pending_descendant_invalidations(conn)
     reap_worker_zombies()
     result.reclaimed = _kb.release_stale_claims(conn)
     if reconcile_orphans:

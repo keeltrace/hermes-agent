@@ -901,6 +901,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        # Persist the transient systemd scope separately from worker_pid. The
+        # systemd-run wrapper can die while descendants remain alive in the
+        # scope, so PID-only crash recovery is not sufficient after restart.
+        if "worker_scope_unit" not in _column_names(conn, "task_runs"):
+            _add_column_if_missing(conn, "task_runs", "worker_scope_unit", "worker_scope_unit TEXT")
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on

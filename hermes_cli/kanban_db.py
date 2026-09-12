@@ -984,6 +984,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    -- Transient user-systemd scope that owns the whole worker cgroup. Unlike
+    -- worker_pid this survives a dead systemd-run wrapper, letting a restarted
+    -- dispatcher reap descendants before it releases the claim.
+    worker_scope_unit   TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1910,6 +1914,20 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _current_worker_scope_unit(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Persisted restart-safe systemd scope for the task's active run, if any."""
+    row = conn.execute(
+        "SELECT r.worker_scope_unit FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    value = row["worker_scope_unit"]
+    return str(value) if value else None
+
+
 def _end_or_synthesize_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, status: str,
     summary: Optional[str] = None, metadata: Optional[dict] = None, synthesize: bool,
@@ -2315,7 +2333,10 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            scope_unit=_current_worker_scope_unit(conn, row["id"]),
+            signal_fn=signal_fn,
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2417,7 +2438,26 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
+    termination = _terminate_reclaimed_worker(
+        row["worker_pid"],
+        prev_lock,
+        scope_unit=_current_worker_scope_unit(conn, task_id),
+        signal_fn=signal_fn,
+    )
+    # Manual reclaim is not permission to create a duplicate worker. If our
+    # process or its persisted scope cannot be proven gone, retain ownership and
+    # report failure to the operator instead of releasing the claim.
+    if _worker_survived_termination(termination):
+        if row["status"] == "running":
+            _defer_reclaim_for_live_worker(
+                conn,
+                task_id,
+                prev_lock,
+                int(time.time()),
+                termination,
+                reason="manual_reclaim_worker_alive",
+            )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(

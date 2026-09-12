@@ -7,7 +7,7 @@ Execution branch: `automation/hermes-factory-scope-descendant-reap-v2-20260912`
 
 ## Current result
 
-Status: DONE for the restart-safe Kanban worker-scope reclaim slice.
+Status: PARTIAL. The restart-safe worker-scope reclaim implementation and deterministic regression coverage are complete, but an end-to-end real-systemd descendant-reap proof for this exact commit remains UNVERIFIED in the current runner.
 
 Code commit: `a6238e82692` (`fix(kanban): reap restart-safe worker scopes before reclaim`).
 

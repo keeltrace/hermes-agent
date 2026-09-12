@@ -3478,6 +3478,238 @@ def _finalize_descendant_invalidation_after_termination(
         return {"state": "invalidated", "id": task_id, "entry": entry, "termination": termination}
 
 
+def _finalize_direct_status_transition_after_termination(
+    conn: sqlite3.Connection,
+    plan: dict[str, Any],
+    termination: dict[str, Any],
+    *,
+    author: str,
+) -> dict[str, Any]:
+    """Finalize a dashboard/direct running-task transition after scope death is proven.
+
+    The caller persists ``direct_status_transition_pending`` while retaining the
+    exact run/claim/PID owner, stops the worker scope outside the SQLite write
+    lock, then calls this CAS finalizer.  Scope-stop failure or ownership drift
+    leaves the task running so a replacement worker can never overlap the old
+    one.  Parent readiness is re-checked after termination because it may change
+    while the scope stop is in flight.
+    """
+    task_id = str(plan["id"])
+    expected_run_id = plan.get("run_id")
+    expected_pid = plan.get("worker_pid")
+    expected_lock = plan.get("claim_lock")
+    requested_status = str(plan.get("requested_status") or "todo")
+    effective_status = str(plan.get("effective_status") or requested_status)
+    scope_unit = str(plan.get("scope_unit") or "").strip()
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        scope_proven = bool(
+            scope_unit
+            and termination.get("terminated")
+            and termination.get("scope_stopped")
+            and termination.get("scope_unit") == scope_unit
+        )
+        if not scope_proven:
+            _append_event(
+                conn,
+                task_id,
+                "direct_status_transition_deferred",
+                {
+                    "reason": "worker_scope_termination_unproven",
+                    "requested_status": requested_status,
+                    "effective_status": effective_status,
+                    "worker_pid": expected_pid,
+                    "claim_lock": expected_lock,
+                    "scope_unit": scope_unit or None,
+                    "termination": termination,
+                    "author": author,
+                },
+                run_id=expected_run_id,
+            )
+            return {
+                "state": "deferred",
+                "id": task_id,
+                "status": "running",
+                "termination": termination,
+            }
+
+        ownership_matches = bool(
+            row
+            and row["status"] == "running"
+            and row["current_run_id"] == expected_run_id
+            and row["worker_pid"] == expected_pid
+            and row["claim_lock"] == expected_lock
+        )
+        if not ownership_matches:
+            if row is not None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "direct_status_transition_stale",
+                    {
+                        "reason": "ownership_changed_after_termination",
+                        "requested_status": requested_status,
+                        "expected_run_id": expected_run_id,
+                        "current_run_id": row["current_run_id"],
+                    },
+                    run_id=row["current_run_id"],
+                )
+            return {
+                "state": "stale",
+                "id": task_id,
+                "status": row["status"] if row is not None else None,
+                "termination": termination,
+            }
+
+        landing_status = effective_status
+        if landing_status in {"ready", "review"} and not _parents_satisfied(conn, task_id):
+            landing_status = "todo"
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="reclaimed",
+            status="reclaimed",
+            summary=f"status changed to {landing_status} (dashboard/direct)",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL WHERE id = ?",
+            (landing_status, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "direct_status_transition_completed",
+            {
+                "status": landing_status,
+                "requested_status": requested_status,
+                "effective_status": effective_status,
+                "author": author,
+            },
+            run_id=run_id,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "status",
+            {"status": landing_status, "requested_status": requested_status},
+            run_id=run_id,
+        )
+        return {
+            "state": "transitioned",
+            "id": task_id,
+            "status": landing_status,
+            "run_id": run_id,
+            "termination": termination,
+        }
+
+
+def transition_running_status_fail_closed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    requested_status: str,
+    *,
+    author: str = "dashboard",
+) -> Optional[dict[str, Any]]:
+    """Safely move a currently running task to a non-running dashboard status.
+
+    ``None`` means the task is not currently running and the caller should use
+    its normal non-running transition path.  For a running task, termination
+    intent is committed first while ownership remains intact.  The persisted
+    worker scope is then stopped outside the write transaction and the status is
+    changed only by the CAS finalizer above.
+    """
+    plan: Optional[dict[str, Any]] = None
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT t.status,t.current_run_id,t.worker_pid,t.claim_lock,
+                   r.worker_scope_unit
+            FROM tasks t
+            LEFT JOIN task_runs r ON r.id=t.current_run_id
+            WHERE t.id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return None
+        if not row["current_run_id"]:
+            _append_event(
+                conn,
+                task_id,
+                "direct_status_transition_deferred",
+                {
+                    "reason": "running_task_missing_current_run",
+                    "requested_status": requested_status,
+                    "author": author,
+                },
+            )
+            return {"state": "deferred", "id": task_id, "status": "running"}
+
+        if not str(row["worker_scope_unit"] or "").strip():
+            _append_event(
+                conn,
+                task_id,
+                "direct_status_transition_deferred",
+                {
+                    "reason": "worker_scope_missing",
+                    "requested_status": requested_status,
+                    "worker_pid": row["worker_pid"],
+                    "claim_lock": row["claim_lock"],
+                    "scope_unit": None,
+                    "author": author,
+                },
+                run_id=row["current_run_id"],
+            )
+            return {"state": "deferred", "id": task_id, "status": "running"}
+
+        effective_status = requested_status
+        if requested_status == "ready":
+            resume_status = _retry_status_for_run(conn, task_id, row["current_run_id"])
+            if resume_status == "review":
+                effective_status = "review" if _parents_satisfied(conn, task_id) else "todo"
+        if effective_status == "ready" and not _parents_satisfied(conn, task_id):
+            return {"state": "refused", "id": task_id, "status": "running"}
+
+        plan = {
+            "id": task_id,
+            "run_id": row["current_run_id"],
+            "worker_pid": row["worker_pid"],
+            "claim_lock": row["claim_lock"],
+            "scope_unit": row["worker_scope_unit"],
+            "requested_status": requested_status,
+            "effective_status": effective_status,
+        }
+        _append_event(
+            conn,
+            task_id,
+            "direct_status_transition_pending",
+            {
+                "requested_status": requested_status,
+                "effective_status": effective_status,
+                "worker_pid": row["worker_pid"],
+                "claim_lock": row["claim_lock"],
+                "scope_unit": row["worker_scope_unit"],
+                "author": author,
+            },
+            run_id=row["current_run_id"],
+        )
+
+    assert plan is not None
+    termination = _terminate_reclaimed_worker(
+        plan.get("worker_pid"),
+        plan.get("claim_lock"),
+        scope_unit=plan.get("scope_unit"),
+    )
+    return _finalize_direct_status_transition_after_termination(
+        conn, plan, termination, author=author
+    )
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection, task_id: str, *, author: str,
 ) -> dict[str, Any]:

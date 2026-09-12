@@ -1782,6 +1782,97 @@ def _apply_default_assignee(
     return True
 
 
+def _reconcile_pending_direct_status_transitions(conn: sqlite3.Connection) -> list[str]:
+    """Resume dashboard running-status transitions after a process crash.
+
+    Only the exact run/PID/claim/scope owner captured by the durable pending event
+    may be terminated.  Scope operations happen outside SQLite write transactions;
+    the domain finalizer releases ownership only after scope death is proven.
+    """
+    now = int(time.time())
+    lifecycle = (
+        "direct_status_transition_pending",
+        "direct_status_transition_deferred",
+        "direct_status_transition_completed",
+        "direct_status_transition_stale",
+    )
+    placeholders = ",".join("?" for _ in lifecycle)
+    rows = conn.execute(
+        f"""
+        SELECT e.id AS event_id,e.task_id,e.run_id,e.kind,e.payload,e.created_at,
+               t.worker_pid,t.claim_lock,r.worker_scope_unit
+        FROM task_events e
+        JOIN tasks t ON t.id=e.task_id
+        LEFT JOIN task_runs r ON r.id=t.current_run_id
+        WHERE e.kind IN ({placeholders})
+          AND e.id=(
+              SELECT MAX(x.id) FROM task_events x
+              WHERE x.task_id=e.task_id AND x.kind IN ({placeholders})
+          )
+          AND t.status='running' AND t.current_run_id=e.run_id
+        ORDER BY e.id
+        """,
+        (*lifecycle, *lifecycle),
+    ).fetchall()
+    finalized: list[str] = []
+    for row in rows:
+        if row["kind"] == "direct_status_transition_deferred" and (
+            now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
+        ):
+            continue
+        if row["kind"] not in {
+            "direct_status_transition_pending",
+            "direct_status_transition_deferred",
+        }:
+            continue
+        payload = _kb._json_dict(row["payload"])
+        plan = {
+            "id": row["task_id"],
+            "run_id": row["run_id"],
+            "worker_pid": payload.get("worker_pid"),
+            "claim_lock": payload.get("claim_lock"),
+            "scope_unit": payload.get("scope_unit"),
+            "requested_status": payload.get("requested_status") or "todo",
+            "effective_status": payload.get("effective_status") or payload.get("requested_status") or "todo",
+        }
+        exact_owner = bool(
+            row["worker_pid"] == plan["worker_pid"]
+            and row["claim_lock"] == plan["claim_lock"]
+            and row["worker_scope_unit"] == plan["scope_unit"]
+        )
+        if not exact_owner:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn,
+                    row["task_id"],
+                    "direct_status_transition_stale",
+                    {
+                        "reason": "ownership_changed_before_reconcile",
+                        "requested_status": plan["requested_status"],
+                        "expected_worker_pid": plan["worker_pid"],
+                        "current_worker_pid": row["worker_pid"],
+                    },
+                    run_id=row["run_id"],
+                )
+            continue
+        # No persisted scope means there is no restart-safe worker-tree identity to
+        # stop.  Do not fall back to PID-only termination: the finalizer would
+        # correctly reject that proof, leaving a dead-but-owned task behind.
+        if not str(plan["scope_unit"] or "").strip():
+            continue
+        termination = _kb._terminate_reclaimed_worker(
+            plan["worker_pid"],
+            plan["claim_lock"],
+            scope_unit=plan["scope_unit"],
+        )
+        outcome = _kb._finalize_direct_status_transition_after_termination(
+            conn, plan, termination, author="dispatcher-recovery"
+        )
+        if outcome["state"] == "transitioned":
+            finalized.append(str(row["task_id"]))
+    return finalized
+
+
 def _reconcile_pending_descendant_invalidations(conn: sqlite3.Connection) -> list[str]:
     """Resume ancestor-reopen worker termination after a caller/process crash.
 
@@ -1873,6 +1964,7 @@ def _run_reclaim_phase(
     reconcile_orphans: bool,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    _reconcile_pending_direct_status_transitions(conn)
     _reconcile_pending_descendant_invalidations(conn)
     reap_worker_zombies()
     result.reclaimed = _kb.release_stale_claims(conn)

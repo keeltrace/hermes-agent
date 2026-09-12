@@ -2,53 +2,85 @@
 
 Updated: 2026-09-12
 Canonical repository: `/home/j/.hermes/hermes-agent`
-Execution worktree: `/srv/mega-mcp/worktrees/hermes-agent-automation-hermes-factory-forced-running-transitions-20260912-10213dda`
-Execution branch: `automation/hermes-factory-forced-running-transitions-20260912`
-Implementation commit: `d77c84df06c00d3bfd5788eccb66e94007e5368e`
+Execution worktree: `/srv/mega-mcp/worktrees/hermes-agent-automation-hermes-factory-forced-running-transitions-20260912-10213dda-automation-hermes-factory-prespawn-generation-safety-20260912-5def5732`
+Execution branch: `automation/hermes-factory-prespawn-generation-safety-20260912`
+Implementation commits:
+- `e49ce2f5fd0` — retain ownership through the persisted-scope / pre-PID spawn window for direct-status and ancestor-reopen transitions.
+- `640d0e449a6` — bind manual/TTL/stale/orphan reclaim to a freshly published worker generation and exact generation CAS.
 
 ## Current result
 
-Status: PARTIAL. The remaining structured operator-forced transitions out of `running` are now fail-closed on persisted worker-scope death, with deterministic restart recovery. Full pytest/PyYAML/user-systemd verification remains unavailable in the managed runner.
+Status: PARTIAL. The controllable pre-spawn ownership/reclaim frontier is implemented and verified with dependency-free state-machine tests, lint, typecheck, and compilation. Full pytest/PyYAML/user-systemd verification remains unavailable in the managed runner.
 
-`complete_task`, `block_task`, `request_review(force=True)`, `archive_task`, and `schedule_task` no longer clear a running task's claim/PID/current run merely because an operator requested a state change. The shared forced-transition protocol now:
+Hermes Factory now treats the interval between durable run/scope creation and worker PID publication as an owned spawn generation rather than evidence that the worker is already absent. A scope name by itself can no longer be interpreted as successful worker-tree termination while the authorized spawn may still complete.
 
-1. records the exact action, arguments, run id, PID, claim token, and persisted systemd scope in `forced_running_transition_pending` while leaving the task owned and `running`;
-2. refuses incomplete pre-spawn ownership (missing run, claim, PID, or scope), eliminating the persisted-scope-before-spawn orphan race;
-3. stops the exact persisted worker scope outside the SQLite write transaction;
-4. requires both `terminated` and `scope_stopped` proof for that same scope;
-5. rechecks exact run/PID/claim/scope ownership before applying the structured action;
-6. invokes the original domain mutator with `expected_run_id` so worker-owned semantics and normal events/hooks remain intact;
-7. persists completed/deferred/stale outcomes; and
-8. lets the dispatcher recover pending/deferred actions across both crash windows without targeting a changed owner.
+### Direct-status and ancestor-reopen transitions
 
-Worker-owned handoffs carrying the exact `expected_run_id` are unchanged and never terminate their own scope. Non-running operator paths also gained a second CAS boundary so a task claimed after preflight cannot have its new owner cleared by a stale operator write.
+1. `transition_running_status_fail_closed()` requires a complete run/claim/PID/scope generation before attempting a stop.
+2. Running-descendant invalidation does the same for ancestor reopen.
+3. Pre-spawn requests are persisted as deferred intents while ownership remains `running`.
+4. Dispatcher recovery can bind the PID exactly once after the same run/claim/scope generation publishes it, then perform the original stop/finalize request.
+5. `worker_identity_incomplete` recovery is reconsidered immediately after PID publication rather than waiting through the ordinary failed-stop backoff.
+6. Finalizers re-read and CAS-check the exact current scope as well as run/PID/claim before clearing ownership.
+7. Scope identity drift after stop proof is classified stale and does not release the changed owner.
+
+### Reclaim paths
+
+Manual reclaim, TTL-expired claim reclaim, heartbeat-stale reclaim, and orphan reconciliation now share a fail-closed pre-spawn rule:
+
+1. if an active run has not published a positive PID, reclaim is deferred and the lease is extended;
+2. the defer is recorded as `reclaim_deferred` with the exact run/claim/scope context;
+3. once a PID is published, reclaim takes a fresh worker-generation snapshot instead of continuing with the stale pre-spawn row;
+4. termination is performed against that fresh PID/claim/scope identity;
+5. final release rechecks the same run/PID/claim/scope generation under the write transaction;
+6. TTL finalization also rechecks expiry and heartbeat; heartbeat-stale finalization rechecks heartbeat; orphan finalization rechecks its broken-bookkeeping predicate;
+7. a heartbeat or scope-generation change after termination proof prevents ownership release.
+
+The existing max-runtime live-worker defer behavior remains intact; a standard-library regression was added after a diff review caught and repaired an accidental variable substitution before commit.
 
 ## Verification evidence
 
-- `python3 -m compileall -q hermes_cli/kanban_db.py hermes_cli/kanban_db_dispatch.py tests/hermes_cli/test_kanban_forced_running_transitions.py` — PASS.
-- `python3 -m unittest -q tests.hermes_cli.test_kanban_forced_running_transitions tests.hermes_cli.test_kanban_direct_status_scope_safety tests.hermes_cli.test_kanban_parent_reopen_scope_safety tests.hermes_cli.test_kanban_scope_reclaim` — PASS: 35/35, 0 failures, 0 errors.
-- New forced-transition suite — PASS: 10/10. It covers all five structured actions, worker-owned handoffs, scope-stop failure, missing scope, incomplete pre-spawn PID identity, stale-owner protection, crash after durable pending intent, crash after scope stop before action finalization, database close/reopen recovery, and a non-running-preflight/claim race.
+Post-commit focused command:
+
+`PYTHONPATH=. python3 -m unittest -q tests.hermes_cli.test_kanban_scope_reclaim tests.hermes_cli.test_kanban_direct_status_scope_safety tests.hermes_cli.test_kanban_parent_reopen_scope_safety tests.hermes_cli.test_kanban_forced_running_transitions`
+
+Result: **PASS — 49/49 tests, 0 failures, 0 errors.**
+
+Coverage includes:
+- direct status mutation during the pre-spawn scope/PID window;
+- ancestor reopen in both standalone and caller-owned transaction modes;
+- dispatcher recovery after PID publication for the same generation;
+- scope drift after stop proof;
+- manual, TTL, heartbeat-stale, and orphan reclaim before PID publication;
+- PID publication racing the defer/reclaim boundary;
+- heartbeat mutation racing stale finalization;
+- max-runtime live-worker defer behavior;
+- the previously verified structured forced-running transition matrix.
+
+Additional verification:
+- `python3 -m compileall -q ...` for modified code/tests — PASS.
 - MegaMCP lint runner — PASS.
 - MegaMCP typecheck runner — PASS.
-- MegaMCP generic test runner — UNVERIFIED / environment-blocked: `/usr/bin/python3: No module named pytest`.
-- Focused tests emit best-effort observability warnings because PyYAML is absent; those hooks are intentionally non-fatal and the state-machine assertions pass.
-- Real user-systemd scope destruction remains UNVERIFIED in this managed runner; tests exercise the exact scope-control contract with deterministic fakes.
+- Broader legacy pytest-backed Kanban modules — **UNVERIFIED / environment-blocked** because this sandbox has no `pytest` module.
+- Best-effort observability hooks emit `ModuleNotFoundError: yaml` warnings because PyYAML is absent; the hooks are intentionally non-fatal and all state-machine assertions above pass.
+- Real user-systemd scope destruction remains **UNVERIFIED** in this managed runner; tests exercise the persisted-scope contract with deterministic fakes.
 
-## Defects repaired
+## Defects found and repaired
 
-1. Operator completion could mark a running task done and release its claim while its worker tree was still alive.
-2. Operator block/schedule/archive could make a task non-running while a scoped worker continued executing.
-3. `request_review(force=True)` treated force as permission to abandon a live worker claim instead of first proving worker-tree death.
-4. Structured transitions had no durable action intent or restart recovery across the scope-stop/finalize gap.
-5. A stale recovery request could otherwise terminate or release a replacement owner.
-6. PID-only or scope-only/incomplete pre-spawn identity could be mistaken for sufficient termination proof.
-7. A dispatcher claim acquired after a non-running preflight could race the final operator write and lose ownership.
-8. Worker-owned transitions needed to remain self-handoffs rather than killing their own systemd scope; the exact-run path is preserved.
+1. A direct operator transition could stop a not-yet-created persisted scope, interpret that as worker death, and clear ownership before the already-authorized spawn published its PID.
+2. Ancestor reopen had the same pre-spawn descendant race.
+3. Deferred pre-spawn intents initially inherited failed-stop backoff, delaying recovery after the PID became available.
+4. Direct/descendant finalizers did not CAS the current persisted scope identity after stop proof.
+5. Manual reclaim could release a pre-spawn task after a successful no-op scope stop.
+6. TTL-expired, heartbeat-stale, and orphan reconciliation could make the same mistake.
+7. Reclaim could continue using a stale `worker_pid=None` snapshot even if PID publication won the race immediately after the defer check.
+8. Heartbeat-stale reclaim could continue using an older run age or stale heartbeat after the active generation changed.
+9. A review-time broad replacement accidentally referenced an undefined `generation` variable in max-runtime defer handling; diff attack found it before commit, it was repaired, and a direct regression test was added.
 
 ## Known verification limitations
 
-The full pytest suite, PyYAML-backed observability integration, and real user-systemd lifecycle are UNVERIFIED in this runner. No live systemd claim is made.
+The full pytest suite, PyYAML-backed observability integration, and real user-systemd lifecycle are UNVERIFIED in this runner. No live systemd claim is made. No external deployment or push was performed.
 
 ## Next execution frontier
 
-Close the same pre-spawn ownership gap in the older direct-status and ancestor-reopen two-phase paths. Audit `transition_running_status_fail_closed()` and descendant invalidation/reopen recovery for the window where `worker_scope_unit` is persisted but `worker_pid` has not yet been established. Require a complete run/claim/PID/scope generation before any scope-stop/release decision, add deterministic tests that race operator mutation against worker spawn, and prove no path can report a successful stop of a not-yet-created scope and then clear ownership before the authorized spawn occurs.
+Bind the remaining automatic worker-death paths to the same exact generation discipline, starting with `enforce_max_runtime()` and `_reclaim_dead_workers()` / crash detection. Capture run id, PID, claim token, persisted scope, and active-run start from one fresh generation snapshot; terminate outside the SQLite write lock; then CAS the identical generation before ending the run or releasing ownership. Add adversarial tests for scope drift after termination, run replacement between scan and stop, PID reuse/change, and active-run-start replacement so timeout/crash cleanup cannot terminate or release a newer worker generation.

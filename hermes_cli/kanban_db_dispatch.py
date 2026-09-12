@@ -459,31 +459,75 @@ def heartbeat_worker(
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Record liveness for one exact published worker generation.
 
-    Liveness signal orthogonal to the PID check: a worker whose forked child
-    (train loop, crawl) is stuck can still have a live Python process.
-    Returns False if the task is not running or its claim expired.
+    A heartbeat without a run identity is not authority to keep whichever run
+    currently owns the task alive.  This matters because worker processes and
+    claimer tokens can outlive/recur across retries.  The task row and active
+    run must still describe the same complete run/PID/claim/scope/start
+    generation or the heartbeat fails closed without writing an event.
     """
+    if expected_run_id is None:
+        return False
+    try:
+        run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return False
+    if run_id <= 0:
+        return False
+
     now = int(time.time())
     with _kb.write_txn(conn):
-        sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
-        params: tuple = (now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params += (int(expected_run_id),)
-        cur = conn.execute(sql, params)
+        generation = _kb._running_worker_generation_row(conn, task_id)
+        if (
+            generation is None
+            or generation["status"] != "running"
+            or generation["current_run_id"] != run_id
+            or generation["worker_pid"] is None
+            or int(generation["worker_pid"]) <= 0
+            or not generation["claim_lock"]
+            or not generation["worker_scope_unit"]
+            or generation["active_started_at"] is None
+        ):
+            return False
+
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND worker_pid = ? AND claim_lock = ?",
+            (
+                now,
+                task_id,
+                run_id,
+                generation["worker_pid"],
+                generation["claim_lock"],
+            ),
+        )
         if cur.rowcount != 1:
             return False
-        run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else _kb._current_run_id(conn, task_id)
+
+        run_cur = conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL "
+            "AND worker_pid = ? AND claim_lock = ? AND worker_scope_unit = ? "
+            "AND started_at = ?",
+            (
+                now,
+                run_id,
+                task_id,
+                generation["worker_pid"],
+                generation["claim_lock"],
+                generation["worker_scope_unit"],
+                generation["active_started_at"],
+            ),
         )
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (now, run_id))
+        if run_cur.rowcount != 1:
+            raise RuntimeError("running task/run generation diverged during worker heartbeat")
+
         _kb._append_event(
-            conn, task_id, "heartbeat",
+            conn,
+            task_id,
+            "heartbeat",
             {"note": note} if note else None,
             run_id=run_id,
         )

@@ -2351,29 +2351,75 @@ def goal_run_status(
 
 
 def heartbeat_claim(
-    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> bool:
-    """Extend a running claim; True if we still own it."""
+    """Extend one exact running worker generation's lease.
+
+    Claim tokens are intentionally reusable across sequential runs, so
+    ``task_id + claim_lock`` is not sufficient ownership authority.  A worker
+    heartbeat must name the run it belongs to, and that run must still be the
+    task's complete published generation (run, PID, claim, scope, start).
+
+    ``expected_run_id=None`` fails closed for compatibility with legacy
+    callers instead of extending whichever run happens to own the task now.
+    """
+    if expected_run_id is None:
+        return False
+    try:
+        run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return False
+    if run_id <= 0:
+        return False
+
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
+        generation = _running_worker_generation_row(conn, task_id)
+        if (
+            generation is None
+            or generation["status"] != "running"
+            or generation["current_run_id"] != run_id
+            or generation["claim_lock"] != lock
+            or generation["worker_pid"] is None
+            or int(generation["worker_pid"]) <= 0
+            or not generation["worker_scope_unit"]
+            or generation["active_started_at"] is None
+        ):
+            return False
+
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND claim_lock = ? AND worker_pid = ?",
+            (expires, task_id, run_id, lock, generation["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
-        _extend_run_claim(conn, task_id, expires)
+
+        run_cur = conn.execute(
+            "UPDATE task_runs SET claim_expires = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL "
+            "AND claim_lock = ? AND worker_pid = ? AND worker_scope_unit = ? "
+            "AND started_at = ?",
+            (
+                expires,
+                run_id,
+                task_id,
+                lock,
+                generation["worker_pid"],
+                generation["worker_scope_unit"],
+                generation["active_started_at"],
+            ),
+        )
+        if run_cur.rowcount != 1:
+            raise RuntimeError("running task/run generation diverged during heartbeat lease renewal")
         return True
-
-
-def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> Optional[int]:
-    """Mirror a task claim extension onto its active run row; returns that run id."""
-    run_id = _current_run_id(conn, task_id)
-    if run_id is not None:
-        conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (expires, run_id))
-    return run_id
 
 
 def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:

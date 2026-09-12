@@ -32,7 +32,7 @@ MIN_UPSTREAM_BASE="53e32d0581"
 git -C "$ROOT" merge-base --is-ancestor "$MIN_UPSTREAM_BASE" HEAD   || fail "refusing activation from stale token-lean branch; latest required upstream base $MIN_UPSTREAM_BASE is absent"
 tracked_dirty="$(git -C "$ROOT" status --porcelain --untracked-files=no)"
 [[ -z "$tracked_dirty" ]] || fail "refusing activation from a dirty tracked tree; commit the token-lean rollout first"
-for required in   agent/token_economy.py   agent/token_economy_store.py   tools/token_lean_profile.py   tools/lean_tool_schemas.py   tools/token_economy_tools.py   scripts/activate_token_lean.sh; do
+for required in   agent/token_economy.py   agent/token_economy_store.py   tools/token_lean_profile.py   tools/lean_tool_schemas.py   tools/token_economy_tools.py   scripts/activate_token_lean.sh   scripts/configure_resilient_free_fallbacks.py; do
   [[ -f "$ROOT/$required" ]] || fail "missing token-lean rollout file: $required"
 done
 
@@ -169,6 +169,12 @@ set_cfg token_economy.context_file_max_chars 4000
 set_cfg token_economy.short_context_ceiling 32000
 set_cfg token_economy.work_context_ceiling 96000
 set_cfg token_economy.autonomous_context_ceiling 192000
+
+# Build a cross-provider escape ring from providers that are actually resolvable
+# on this host. Missing credentials are skipped and existing operator fallbacks
+# are preserved. This keeps an exhausted OmniRoute anonymous pool from stranding
+# the whole Hermes turn.
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" "$ROOT/scripts/configure_resilient_free_fallbacks.py"
 
 # Verify the persisted token-economy settings and the effective runtime tool projection
 # without printing unrelated config or secrets.
@@ -310,5 +316,6 @@ printf 'TOKEN_LEAN_ACTIVATION_OK\n'
 printf 'Report: %s\n' "$REPORT"
 printf 'Report SHA-256: %s\n' "$(sha256sum "$REPORT" | awk '{print $1}')"
 printf 'Original config backup: %s\n' "$BACKUP"
-printf 'Run: exec hermes\n'
+printf 'Run from a neutral directory (NOT this source repo): cd "$HOME" && exec hermes\n'
 printf 'Then /new; after one turn run /context waste, and later /insights waste.\n'
+printf 'Why: launching inside the Hermes Git repo selects token-economy work mode and injects repo context/tools into ordinary chat.\n'

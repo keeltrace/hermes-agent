@@ -368,5 +368,274 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
         self.assertIsNotNone(row["claim_lock"])
 
 
+    def test_scope_stop_success_never_signals_reused_pid(self) -> None:
+        signals: list[tuple[int, int]] = []
+        with patch.object(kb, "_pid_alive", return_value=True):
+            info = kbd._terminate_reclaimed_worker(
+                717171,
+                f"{kb._host_prefix()}test",
+                scope_unit="hermes-worker-kanban-pid-reuse-run-1.scope",
+                signal_fn=lambda pid, sig: signals.append((pid, sig)),
+                scope_stop_fn=lambda _unit: True,
+            )
+        self.assertTrue(info["terminated"])
+        self.assertTrue(info["scope_stopped"])
+        self.assertEqual(signals, [])
+
+    def test_max_runtime_scope_drift_after_stop_retains_owner(self) -> None:
+        scope = "hermes-worker-kanban-timeout-scope-drift-run-1.scope"
+        run_id = self._running_task("timeout-scope-drift", pid=727272, scope=scope)
+        self.conn.execute(
+            "UPDATE tasks SET max_runtime_seconds=1 WHERE id='timeout-scope-drift'"
+        )
+        replacement_scope = "hermes-worker-kanban-timeout-scope-drift-run-2.scope"
+
+        def drift_scope(*_args, **_kwargs):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?",
+                (replacement_scope, run_id),
+            )
+            return {
+                "terminated": True,
+                "host_local": True,
+                "termination_attempted": True,
+                "scope_stopped": True,
+                "scope_unit": scope,
+            }
+
+        with patch.object(kb, "_terminate_reclaimed_worker", side_effect=drift_scope):
+            self.assertEqual(kbd.enforce_max_runtime(self.conn), [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id='timeout-scope-drift'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 727272)
+        self.assertIsNotNone(row["claim_lock"])
+
+    def test_max_runtime_active_start_change_after_stop_retains_owner(self) -> None:
+        scope = "hermes-worker-kanban-timeout-start-drift-run-1.scope"
+        run_id = self._running_task("timeout-start-drift", pid=737373, scope=scope)
+        self.conn.execute(
+            "UPDATE tasks SET max_runtime_seconds=1 WHERE id='timeout-start-drift'"
+        )
+
+        def refresh_start(*_args, **_kwargs):
+            self.conn.execute(
+                "UPDATE task_runs SET started_at=? WHERE id=?",
+                (int(time.time()), run_id),
+            )
+            return {
+                "terminated": True,
+                "host_local": True,
+                "termination_attempted": True,
+                "scope_stopped": True,
+                "scope_unit": scope,
+            }
+
+        with patch.object(kb, "_terminate_reclaimed_worker", side_effect=refresh_start):
+            self.assertEqual(kbd.enforce_max_runtime(self.conn), [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid FROM tasks WHERE id='timeout-start-drift'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 737373)
+
+    def test_max_runtime_incomplete_generation_fails_closed(self) -> None:
+        run_id = self._running_task("timeout-no-scope", pid=757575, scope=None)
+        self.conn.execute(
+            "UPDATE tasks SET max_runtime_seconds=1 WHERE id='timeout-no-scope'"
+        )
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("incomplete generation must not be terminated"),
+        ):
+            self.assertEqual(kbd.enforce_max_runtime(self.conn), [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_expires FROM tasks WHERE id='timeout-no-scope'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 757575)
+        self.assertGreater(row["claim_expires"], int(time.time()))
+        event = self.conn.execute(
+            "SELECT kind,payload FROM task_events WHERE task_id='timeout-no-scope' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(event["kind"], "reclaim_deferred")
+        self.assertIn("max_runtime_worker_generation_incomplete", event["payload"])
+
+    def test_dead_worker_uses_active_run_start_for_launch_grace(self) -> None:
+        scope = "hermes-worker-kanban-fresh-retry-run-1.scope"
+        run_id = self._running_task("fresh-retry", pid=767676, scope=scope)
+        self.conn.execute(
+            "UPDATE tasks SET started_at=? WHERE id='fresh-retry'",
+            (int(time.time()) - 7200,),
+        )
+        self.conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (int(time.time()), run_id),
+        )
+        with patch.object(kb, "_resolve_crash_grace_seconds", return_value=30), patch.object(
+            kb,
+            "_pid_alive",
+            side_effect=AssertionError("fresh active run must stay inside crash grace"),
+        ):
+            sweep = kbd._reclaim_dead_workers(self.conn)
+        self.assertEqual(sweep.crashed, [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid FROM tasks WHERE id='fresh-retry'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 767676)
+
+    def test_dead_worker_scope_drift_after_stop_retains_owner(self) -> None:
+        scope = "hermes-worker-kanban-dead-scope-drift-run-1.scope"
+        run_id = self._running_task("dead-scope-drift", pid=777777, scope=scope)
+        replacement_scope = "hermes-worker-kanban-dead-scope-drift-run-2.scope"
+
+        def drift_scope(*_args, **_kwargs):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?",
+                (replacement_scope, run_id),
+            )
+            return {
+                "terminated": True,
+                "host_local": True,
+                "termination_attempted": True,
+                "scope_stopped": True,
+                "scope_unit": scope,
+            }
+
+        with patch.object(kb, "_pid_alive", return_value=False), patch.object(
+            kb, "_terminate_reclaimed_worker", side_effect=drift_scope
+        ):
+            sweep = kbd._reclaim_dead_workers(self.conn)
+        self.assertEqual(sweep.crashed, [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id='dead-scope-drift'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["worker_pid"], 777777)
+        self.assertIsNotNone(row["claim_lock"])
+
+    def test_dead_worker_replacement_run_after_stop_retains_new_generation(self) -> None:
+        scope = "hermes-worker-kanban-dead-replaced-run-1.scope"
+        old_run = self._running_task("dead-replaced", pid=787878, scope=scope)
+        replacement_scope = "hermes-worker-kanban-dead-replaced-run-2.scope"
+        replacement_pid = 797979
+        replacement_run: list[int] = []
+
+        def replace_run(*_args, **_kwargs):
+            now = int(time.time())
+            claim = f"{kb._host_prefix()}replacement"
+            cur = self.conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_scope_unit,started_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    "dead-replaced",
+                    "default",
+                    "running",
+                    claim,
+                    now + 300,
+                    replacement_pid,
+                    replacement_scope,
+                    now,
+                ),
+            )
+            replacement_run.append(int(cur.lastrowid))
+            self.conn.execute(
+                "UPDATE tasks SET current_run_id=?,worker_pid=?,claim_lock=?,claim_expires=?,started_at=? "
+                "WHERE id='dead-replaced'",
+                (int(cur.lastrowid), replacement_pid, claim, now + 300, now),
+            )
+            return {
+                "terminated": True,
+                "host_local": True,
+                "termination_attempted": True,
+                "scope_stopped": True,
+                "scope_unit": scope,
+            }
+
+        with patch.object(kb, "_pid_alive", return_value=False), patch.object(
+            kb, "_terminate_reclaimed_worker", side_effect=replace_run
+        ):
+            sweep = kbd._reclaim_dead_workers(self.conn)
+        self.assertEqual(sweep.crashed, [])
+        self.assertTrue(replacement_run)
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id='dead-replaced'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], replacement_run[0])
+        self.assertNotEqual(row["current_run_id"], old_run)
+        self.assertEqual(row["worker_pid"], replacement_pid)
+        self.assertTrue(row["claim_lock"].endswith("replacement"))
+
+
+    def test_post_reclaim_failure_accounting_never_mutates_replacement_run(self) -> None:
+        scope = "hermes-worker-kanban-accounting-replacement-run-1.scope"
+        old_run = self._running_task("accounting-replacement", pid=808080, scope=scope)
+        # Model the state immediately after the old run was reclaimed.
+        self.conn.execute(
+            "UPDATE task_runs SET status='crashed',outcome='crashed',ended_at=?,claim_lock=NULL,claim_expires=NULL,worker_pid=NULL "
+            "WHERE id=?",
+            (int(time.time()), old_run),
+        )
+        self.conn.execute(
+            "UPDATE tasks SET status='ready',current_run_id=NULL,worker_pid=NULL,claim_lock=NULL,claim_expires=NULL "
+            "WHERE id='accounting-replacement'"
+        )
+        # A replacement wins before delayed circuit-breaker accounting runs.
+        now = int(time.time())
+        replacement_claim = f"{kb._host_prefix()}accounting-replacement"
+        cur = self.conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_scope_unit,started_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "accounting-replacement",
+                "default",
+                "running",
+                replacement_claim,
+                now + 300,
+                818181,
+                "hermes-worker-kanban-accounting-replacement-run-2.scope",
+                now,
+            ),
+        )
+        replacement_run = int(cur.lastrowid)
+        self.conn.execute(
+            "UPDATE tasks SET status='running',current_run_id=?,worker_pid=?,claim_lock=?,claim_expires=?,consecutive_failures=0,last_failure_error=NULL "
+            "WHERE id='accounting-replacement'",
+            (replacement_run, 818181, replacement_claim, now + 300),
+        )
+
+        self.assertFalse(
+            kbd._record_task_failure(
+                self.conn,
+                "accounting-replacement",
+                "old generation crashed",
+                outcome="crashed",
+                force_trip=True,
+                require_unclaimed=True,
+            )
+        )
+        row = self.conn.execute(
+            "SELECT status,current_run_id,worker_pid,claim_lock,consecutive_failures,last_failure_error "
+            "FROM tasks WHERE id='accounting-replacement'"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], replacement_run)
+        self.assertEqual(row["worker_pid"], 818181)
+        self.assertEqual(row["claim_lock"], replacement_claim)
+        self.assertEqual(row["consecutive_failures"], 0)
+        self.assertIsNone(row["last_failure_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

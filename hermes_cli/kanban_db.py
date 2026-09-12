@@ -1934,7 +1934,7 @@ def _running_worker_generation_row(
     """Snapshot the exact active worker generation used by reclaim CAS checks."""
     return conn.execute(
         "SELECT t.id,t.status,t.current_run_id,t.worker_pid,t.claim_lock,t.claim_expires,"
-        "t.last_heartbeat_at,r.worker_scope_unit,"
+        "t.last_heartbeat_at,t.max_runtime_seconds,r.worker_scope_unit,"
         "COALESCE(r.started_at,t.started_at) AS active_started_at "
         "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id=?",
         (task_id,),

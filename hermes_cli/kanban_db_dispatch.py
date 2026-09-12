@@ -349,13 +349,17 @@ def _terminate_reclaimed_worker(
             info["scope_stop_error"] = f"{type(exc).__name__}: {exc}"[:300]
             return info
         info["scope_stopped"] = True
-        if not pid or pid <= 0 or not _kb._pid_alive(pid):
-            info["terminated"] = True
-            return info
+        # The transient scope is the authoritative worker-tree identity.  A
+        # successful systemctl stop means that cgroup is gone (or was already
+        # gone).  Never follow it with a raw PID signal: the wrapper may have
+        # exited while systemctl was running and the kernel may already have
+        # reused that numeric PID for an unrelated process.
+        info["terminated"] = True
+        return info
 
     if not pid or pid <= 0 or not local_lock:
-        # A persisted scope was stopped above; without a local PID there is
-        # nothing else we are authorised to signal.
+        # Without a validated managed scope and a local PID there is nothing
+        # else we are authorised to signal.
         info["terminated"] = bool(managed_scope and info["scope_stopped"])
         return info
 
@@ -408,21 +412,37 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    expected_generation: Optional[sqlite3.Row] = None,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
-    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
-    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
-    The next tick retries the kill; not spawning a duplicate is what lets the
-    throttled worker finally die.
+    When ``expected_generation`` is supplied, the lease extension is bound to
+    the exact run/PID/claim/scope/start generation that was inspected before
+    termination.  This prevents a stale cleanup attempt from extending or
+    annotating a replacement worker that won the race while systemd/PID control
+    was in flight.
     """
     grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
     with _kb.write_txn(conn):
-        cur = conn.execute(
+        if expected_generation is not None:
+            current = _kb._running_worker_generation_row(conn, task_id)
+            if (
+                not _kb._same_running_worker_generation(current, expected_generation)
+                or current["active_started_at"] != expected_generation["active_started_at"]
+            ):
+                return
+        sql = (
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?"
         )
+        params: tuple = (grace, task_id, claim_lock)
+        if expected_generation is not None:
+            sql += " AND current_run_id = ? AND worker_pid IS ?"
+            params += (
+                expected_generation["current_run_id"],
+                expected_generation["worker_pid"],
+            )
+        cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return
         run_id = _kb._current_run_id(conn, task_id)
@@ -431,7 +451,6 @@ def _defer_reclaim_for_live_worker(
         payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
         payload.update(termination)
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
-
 
 def heartbeat_worker(
     conn: sqlite3.Connection,
@@ -472,89 +491,120 @@ def heartbeat_worker(
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+    """Terminate worker generations whose per-task runtime limit elapsed.
 
-    SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
-    task's source phase so the next tick re-spawns the same kind of worker —
-    unless the circuit breaker already gave up, leaving it blocked. A worker
-    that survives both signals keeps its claim instead: releasing it would let
-    the next tick spawn a duplicate beside the still-running process. Host-local
-    only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+    Timeout authority is bound to one fresh run/PID/claim/scope/start snapshot.
+    Scope/PID control happens outside the SQLite write transaction; the final
+    timeout transition then CAS-checks the identical generation and unchanged
+    runtime policy.  A replacement run can therefore never be released by a
+    stale timeout scan.
     """
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
-        "FROM tasks t "
-        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
-        "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "SELECT id FROM tasks WHERE status = 'running' AND max_runtime_seconds IS NOT NULL"
     ).fetchall()
     for row in rows:
-        lock = row["claim_lock"] or ""
+        tid = row["id"]
+        generation = _kb._running_worker_generation_row(conn, tid)
+        if generation is None or generation["status"] != "running":
+            continue
+        if generation["max_runtime_seconds"] is None:
+            continue
+        lock = generation["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
-        # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
-        # so retries must be measured from the active task_runs row.
-        elapsed = now - int(row["active_started_at"])
-        limit = int(row["max_runtime_seconds"])
+        if generation["active_started_at"] is None:
+            continue
+
+        elapsed = now - int(generation["active_started_at"])
+        limit = int(generation["max_runtime_seconds"])
         if elapsed < limit:
             continue
 
-        pid = int(row["worker_pid"])
-        tid = row["id"]
-        # Share the reclaim termination contract: a timeout is not permission
-        # to release ownership while the old worker is still alive.
+        if not _kb._complete_worker_generation(
+            generation["current_run_id"],
+            generation["worker_pid"],
+            generation["claim_lock"],
+            generation["worker_scope_unit"],
+        ):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                generation["claim_lock"],
+                now,
+                {
+                    "terminated": False,
+                    "termination_attempted": False,
+                    "host_local": True,
+                    "scope_stopped": False,
+                    "scope_unit": generation["worker_scope_unit"],
+                },
+                reason="max_runtime_worker_generation_incomplete",
+                expected_generation=generation,
+            )
+            continue
+
+        pid = int(generation["worker_pid"])
         termination = _kb._terminate_reclaimed_worker(
             pid,
             lock,
-            scope_unit=_kb._current_worker_scope_unit(conn, tid),
+            scope_unit=generation["worker_scope_unit"],
             signal_fn=signal_fn,
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn,
                 tid,
-                row["claim_lock"],
+                generation["claim_lock"],
                 now,
                 termination,
                 reason="max_runtime_worker_alive",
+                expected_generation=generation,
             )
             continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
+            current = _kb._running_worker_generation_row(conn, tid)
+            if (
+                not _kb._same_running_worker_generation(current, generation)
+                or current["active_started_at"] != generation["active_started_at"]
+            ):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "claim_expires = NULL, worker_pid = NULL, last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND worker_pid = ? AND claim_lock IS ?",
+                (
+                    retry_status,
+                    tid,
+                    generation["current_run_id"],
+                    pid,
+                    generation["claim_lock"],
+                ),
             )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": limit,
-                    "retry_status": retry_status,
-                }
-                payload.update(termination)
-                run_id = _kb._end_run(
-                    conn, tid, outcome="timed_out", status="timed_out",
-                    error=error, metadata=payload,
-                )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
-                timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
+            if cur.rowcount != 1:
+                continue
+            payload = {
+                "pid": pid,
+                "elapsed_seconds": int(elapsed),
+                "limit_seconds": limit,
+                "retry_status": retry_status,
+                "run_id": generation["current_run_id"],
+                "worker_scope_unit": generation["worker_scope_unit"],
+            }
+            payload.update(termination)
+            run_id = _kb._end_run(
+                conn, tid, outcome="timed_out", status="timed_out",
+                error=error, metadata=payload,
+            )
+            _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+            timed_out.append(tid)
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
@@ -567,9 +617,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": bool(termination.get("sigkill")),
                     "retry_status": retry_status,
                 },
+                require_unclaimed=True,
             )
     return timed_out
-
 
 # A running task with no heartbeat for this long is inactive regardless of
 # ``dispatch_stale_timeout_seconds`` (spec: ">4h started + no commits in 1h").
@@ -935,63 +985,98 @@ class _CrashSweep:
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
-    """Release host-local ``running`` tasks whose worker PID is dead.
+    """Release host-local running tasks whose exact worker generation is dead.
 
-    Potentially slow scope/PID termination is deliberately performed outside a
-    SQLite write transaction. The subsequent state transition is CAS-guarded by
-    status + PID + claim lock, so another actor can win safely without the
-    dispatcher holding the board write lock across ``systemctl``.
+    Each candidate is refreshed into one run/PID/claim/scope/start snapshot
+    before liveness or scope control.  Termination happens outside SQLite's
+    write transaction and final release CAS-checks that exact generation,
+    including the active-run start used for launch grace.  A replacement run,
+    PID change/reuse, scope drift, or start-generation change therefore leaves
+    the current owner untouched.
     """
     sweep = _CrashSweep()
     rows = conn.execute(
-        "SELECT id, worker_pid, claim_lock, started_at, assignee "
-        "FROM tasks "
-        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+        "SELECT id, assignee FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL"
     ).fetchall()
     host_prefix = _kb._host_prefix()
     for row in rows:
-        lock = row["claim_lock"] or ""
+        generation = _kb._running_worker_generation_row(conn, row["id"])
+        if generation is None or generation["status"] != "running":
+            continue
+        lock = generation["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
-        # Launch-window grace so a freshly-spawned worker isn't reclaimed
-        # before its PID is visible on /proc.
-        started_at = _kb._row_get(row, "started_at")
-        if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
-            continue
-        if _kb._pid_alive(row["worker_pid"]):
+        if not _kb._complete_worker_generation(
+            generation["current_run_id"],
+            generation["worker_pid"],
+            generation["claim_lock"],
+            generation["worker_scope_unit"],
+        ):
+            _defer_reclaim_for_live_worker(
+                conn,
+                row["id"],
+                generation["claim_lock"],
+                int(time.time()),
+                {
+                    "terminated": False,
+                    "termination_attempted": False,
+                    "host_local": True,
+                    "scope_stopped": False,
+                    "scope_unit": generation["worker_scope_unit"],
+                },
+                reason="dead_worker_generation_incomplete",
+                expected_generation=generation,
+            )
             continue
 
-        pid = int(row["worker_pid"])
-        # The wrapper is dead, but a managed gateway may have left live
-        # descendants in the run's transient systemd scope. Reap that whole
-        # cgroup before ownership is released.
+        started_at = generation["active_started_at"]
+        if started_at is not None and time.time() - int(started_at) < _kb._resolve_crash_grace_seconds():
+            continue
+        pid = int(generation["worker_pid"])
+        if _kb._pid_alive(pid):
+            continue
+
         termination = _kb._terminate_reclaimed_worker(
             pid,
-            row["claim_lock"],
-            scope_unit=_kb._current_worker_scope_unit(conn, row["id"]),
+            generation["claim_lock"],
+            scope_unit=generation["worker_scope_unit"],
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn,
                 row["id"],
-                row["claim_lock"],
+                generation["claim_lock"],
                 int(time.time()),
                 termination,
                 reason="dead_wrapper_scope_not_reaped",
+                expected_generation=generation,
             )
             continue
 
-        dead = _classify_dead_worker(pid, row["claim_lock"])
+        dead = _classify_dead_worker(pid, generation["claim_lock"])
         dead.event_payload.update(termination)
         with _kb.write_txn(conn):
+            current = _kb._running_worker_generation_row(conn, row["id"])
+            if (
+                not _kb._same_running_worker_generation(current, generation)
+                or current["active_started_at"] != generation["active_started_at"]
+            ):
+                continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            dead.event_payload["run_id"] = generation["current_run_id"]
+            dead.event_payload["worker_scope_unit"] = generation["worker_scope_unit"]
             cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND worker_pid = ? AND claim_lock IS ?",
+                (
+                    retry_status,
+                    row["id"],
+                    generation["current_run_id"],
+                    pid,
+                    generation["claim_lock"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -1022,10 +1107,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append(
-                    (row["id"], pid, row["claim_lock"], dead.protocol_violation, dead.error_text)
+                    (row["id"], pid, generation["claim_lock"], dead.protocol_violation, dead.error_text)
                 )
     return sweep
-
 
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
@@ -1070,6 +1154,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 },
+                require_unclaimed=True,
             )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
@@ -1081,6 +1166,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
+                require_unclaimed=True,
             )
         if tripped:
             auto_blocked.append(tid)
@@ -1147,6 +1233,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    require_unclaimed: bool = False,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1159,6 +1246,13 @@ def _record_task_failure(
     ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
+
+    ``require_unclaimed=True`` is for post-reclaim timeout/crash accounting.
+    Those callers already ended the failed run and released ownership in a
+    prior transaction; if a replacement run has been claimed meanwhile, the
+    stale failure must not increment, block, or annotate that new generation.
+    The original timeout/crash event remains durable even when accounting is
+    skipped and can be reconciled later.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1169,6 +1263,8 @@ def _record_task_failure(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if require_unclaimed and row["current_run_id"] is not None:
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])

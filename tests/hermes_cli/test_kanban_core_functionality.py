@@ -1276,6 +1276,121 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
 
 
 
+def test_max_runtime_does_not_release_claim_when_worker_survives_termination(
+    kanban_home, monkeypatch
+):
+    """A timeout must not make the task spawnable while its old worker is alive."""
+    import signal
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="timeout survivor",
+            assignee="default",
+            max_runtime_seconds=1,
+        )
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kbd._set_worker_pid(conn, tid, 424242)
+        old = int(time.time()) - 120
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (old, claimed.current_run_id),
+        )
+        conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old, tid))
+        conn.commit()
+
+        signals: list[int] = []
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(kbd, "_poll_worker_exit", lambda _pid: False)
+
+        assert kbd.enforce_max_runtime(
+            conn,
+            signal_fn=lambda _pid, sig: signals.append(sig),
+        ) == []
+
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None
+        assert row["claim_expires"] is not None
+        assert row["worker_pid"] == 424242
+        assert signals == [signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)]
+
+        deferred = [
+            json.loads(r["payload"])
+            for r in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'reclaim_deferred'",
+                (tid,),
+            )
+        ]
+        assert deferred[-1]["reason"] == "max_runtime_worker_alive"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'timed_out'",
+            (tid,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_max_runtime_releases_claim_after_worker_really_exits(kanban_home, monkeypatch):
+    """The existing timeout retry path still runs once termination is proven."""
+    import signal
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="timeout exits",
+            assignee="default",
+            max_runtime_seconds=1,
+        )
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kbd._set_worker_pid(conn, tid, 434343)
+        old = int(time.time()) - 120
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (old, claimed.current_run_id),
+        )
+        conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old, tid))
+        conn.commit()
+
+        state = {"alive": True}
+
+        def terminate(_pid, sig):
+            if sig == signal.SIGTERM:
+                state["alive"] = False
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: state["alive"])
+
+        assert kbd.enforce_max_runtime(conn, signal_fn=terminate) == [tid]
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["worker_pid"] is None
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'timed_out' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()[0]
+        )
+        assert payload["termination_attempted"] is True
+        assert payload["terminated"] is True
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Unified failure counter — timeout + crash paths increment the same counter
 # as spawn failures, and the circuit breaker trips after N consecutive

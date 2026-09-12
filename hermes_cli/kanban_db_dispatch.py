@@ -1914,16 +1914,19 @@ def _reconcile_pending_direct_status_transitions(conn: sqlite3.Connection) -> li
     ).fetchall()
     finalized: list[str] = []
     for row in rows:
-        if row["kind"] == "direct_status_transition_deferred" and (
-            now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
-        ):
-            continue
         if row["kind"] not in {
             "direct_status_transition_pending",
             "direct_status_transition_deferred",
         }:
             continue
         payload = _kb._json_dict(row["payload"])
+        deferred_reason = str(payload.get("reason") or "")
+        if (
+            row["kind"] == "direct_status_transition_deferred"
+            and deferred_reason != "worker_identity_incomplete"
+            and now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
+        ):
+            continue
         plan = {
             "id": row["task_id"],
             "run_id": row["run_id"],
@@ -1933,6 +1936,19 @@ def _reconcile_pending_direct_status_transitions(conn: sqlite3.Connection) -> li
             "requested_status": payload.get("requested_status") or "todo",
             "effective_status": payload.get("effective_status") or payload.get("requested_status") or "todo",
         }
+        # A pre-spawn deferred intent is allowed to bind the PID exactly once,
+        # after the authorized spawn fills in the same run/claim/scope generation.
+        # No other ownership field may drift.
+        if (
+            str(payload.get("reason") or "") == "worker_identity_incomplete"
+            and plan["worker_pid"] is None
+            and row["claim_lock"] == plan["claim_lock"]
+            and row["worker_scope_unit"] == plan["scope_unit"]
+            and _kb._complete_worker_generation(
+                plan["run_id"], row["worker_pid"], row["claim_lock"], row["worker_scope_unit"]
+            )
+        ):
+            plan["worker_pid"] = row["worker_pid"]
         exact_owner = bool(
             row["worker_pid"] == plan["worker_pid"]
             and row["claim_lock"] == plan["claim_lock"]
@@ -1953,10 +1969,12 @@ def _reconcile_pending_direct_status_transitions(conn: sqlite3.Connection) -> li
                     run_id=row["run_id"],
                 )
             continue
-        # No persisted scope means there is no restart-safe worker-tree identity to
-        # stop.  Do not fall back to PID-only termination: the finalizer would
-        # correctly reject that proof, leaving a dead-but-owned task behind.
-        if not str(plan["scope_unit"] or "").strip():
+        # A complete generation is required before any stop attempt. A persisted
+        # scope name alone may describe a not-yet-created systemd unit while the
+        # already-authorized spawn is still in flight.
+        if not _kb._complete_worker_generation(
+            plan["run_id"], plan["worker_pid"], plan["claim_lock"], plan["scope_unit"]
+        ):
             continue
         termination = _kb._terminate_reclaimed_worker(
             plan["worker_pid"],
@@ -2007,13 +2025,16 @@ def _reconcile_pending_descendant_invalidations(conn: sqlite3.Connection) -> lis
     ).fetchall()
     finalized: list[str] = []
     for row in rows:
-        if row["kind"] == "descendant_invalidation_deferred" and (
-            now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
-        ):
-            continue
         if row["kind"] not in {"descendant_invalidation_pending", "descendant_invalidation_deferred"}:
             continue
         payload = _kb._json_dict(row["payload"])
+        deferred_reason = str(payload.get("reason") or "")
+        if (
+            row["kind"] == "descendant_invalidation_deferred"
+            and deferred_reason != "worker_identity_incomplete"
+            and now - int(row["created_at"] or 0) < _kb.RECLAIM_DEFER_GRACE_SECONDS
+        ):
+            continue
         plan = {
             "id": row["task_id"],
             "ancestor": payload.get("ancestor"),
@@ -2023,6 +2044,16 @@ def _reconcile_pending_descendant_invalidations(conn: sqlite3.Connection) -> lis
             "scope_unit": payload.get("scope_unit"),
             "resume_status": payload.get("resume_status") or "ready",
         }
+        if (
+            str(payload.get("reason") or "") == "worker_identity_incomplete"
+            and plan["worker_pid"] is None
+            and row["claim_lock"] == plan["claim_lock"]
+            and row["worker_scope_unit"] == plan["scope_unit"]
+            and _kb._complete_worker_generation(
+                plan["run_id"], row["worker_pid"], row["claim_lock"], row["worker_scope_unit"]
+            )
+        ):
+            plan["worker_pid"] = row["worker_pid"]
         exact_owner = bool(
             plan["ancestor"]
             and row["worker_pid"] == plan["worker_pid"]
@@ -2041,6 +2072,10 @@ def _reconcile_pending_descendant_invalidations(conn: sqlite3.Connection) -> lis
                     },
                     run_id=row["run_id"],
                 )
+            continue
+        if not _kb._complete_worker_generation(
+            plan["run_id"], plan["worker_pid"], plan["claim_lock"], plan["scope_unit"]
+        ):
             continue
         termination = _kb._terminate_reclaimed_worker(
             plan["worker_pid"], plan["claim_lock"], scope_unit=plan["scope_unit"],

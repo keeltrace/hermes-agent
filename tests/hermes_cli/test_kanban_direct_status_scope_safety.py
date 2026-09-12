@@ -331,5 +331,86 @@ class DirectStatusScopeSafetyTests(unittest.TestCase):
         self.assertNotIn("_end_run(", body)
 
 
+    def test_prespawn_scope_waits_for_pid_then_recovery_binds_same_generation(self) -> None:
+        task = kb.create_task(self.conn, title="pre-spawn task", assignee="builder")
+        self.assertIsNotNone(kb.claim_task(self.conn, task))
+        row = self.conn.execute(
+            "SELECT current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (task,)
+        ).fetchone()
+        run_id = int(row["current_run_id"])
+        claim_lock = str(row["claim_lock"])
+        self.assertIsNone(row["worker_pid"])
+        scope = f"hermes-worker-kanban-{task}-run-{run_id}.scope"
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?", (scope, run_id)
+            )
+
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("pre-spawn scope must not be treated as a stopped worker"),
+        ):
+            result = kb.transition_running_status_fail_closed(self.conn, task, "todo")
+            finalized = kbd._reconcile_pending_direct_status_transitions(self.conn)
+
+        self.assertEqual(result["state"], "deferred")
+        self.assertEqual(finalized, [])
+        owner = self._task_owner(task)
+        self.assertEqual(owner["status"], "running")
+        self.assertEqual(owner["current_run_id"], run_id)
+        self.assertIsNone(owner["worker_pid"])
+        self.assertEqual(owner["claim_lock"], claim_lock)
+        event = self.conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='direct_status_transition_deferred' "
+            "ORDER BY id DESC LIMIT 1", (task,)
+        ).fetchone()
+        self.assertIn("worker_identity_incomplete", str(event["payload"]))
+
+        # The authorized spawn completes the same run/claim/scope generation.
+        kbd._set_worker_pid(self.conn, task, 565656, scope_unit=scope)
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            return_value={"terminated": True, "scope_stopped": True, "scope_unit": scope},
+        ) as terminate:
+            finalized = kbd._reconcile_pending_direct_status_transitions(self.conn)
+
+        self.assertEqual(finalized, [task])
+        terminate.assert_called_once_with(565656, claim_lock, scope_unit=scope)
+        owner = self._task_owner(task)
+        self.assertEqual(owner["status"], "todo")
+        self.assertIsNone(owner["current_run_id"])
+
+    def test_scope_identity_drift_after_stop_proof_does_not_release_owner(self) -> None:
+        task, run_id, claim_lock, scope = self._running_task(pid=575757)
+        plan = {
+            "id": task,
+            "run_id": run_id,
+            "worker_pid": 575757,
+            "claim_lock": claim_lock,
+            "scope_unit": scope,
+            "requested_status": "todo",
+            "effective_status": "todo",
+        }
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?",
+                (scope.replace(".scope", "-replacement.scope"), run_id),
+            )
+        result = kb._finalize_direct_status_transition_after_termination(
+            self.conn,
+            plan,
+            {"terminated": True, "scope_stopped": True, "scope_unit": scope},
+            author="dashboard",
+        )
+        self.assertEqual(result["state"], "stale")
+        owner = self._task_owner(task)
+        self.assertEqual(owner["status"], "running")
+        self.assertEqual(owner["current_run_id"], run_id)
+        self.assertEqual(owner["worker_pid"], 575757)
+        self.assertEqual(owner["claim_lock"], claim_lock)
+
+
 if __name__ == "__main__":
     unittest.main()

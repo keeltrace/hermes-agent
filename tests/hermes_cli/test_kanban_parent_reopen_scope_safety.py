@@ -242,5 +242,123 @@ class ParentReopenScopeSafetyTests(unittest.TestCase):
         self.assertIn("descendant_invalidation_stale", kinds)
 
 
+    def _prespawn_descendant(self) -> tuple[str, str, int, str, str]:
+        parent = kb.create_task(self.conn, title="pre-spawn ancestor", assignee="planner")
+        self.assertTrue(kb.complete_task(self.conn, parent))
+        child = kb.create_task(
+            self.conn, title="pre-spawn child", assignee="builder", parents=[parent]
+        )
+        self.assertIsNotNone(kb.claim_task(self.conn, child))
+        row = self.conn.execute(
+            "SELECT current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        run_id = int(row["current_run_id"])
+        claim_lock = str(row["claim_lock"])
+        self.assertIsNone(row["worker_pid"])
+        scope = f"hermes-worker-kanban-{child}-run-{run_id}.scope"
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?", (scope, run_id)
+            )
+            self.conn.execute(
+                "UPDATE tasks SET status='todo',completed_at=NULL WHERE id=?", (parent,)
+            )
+        return parent, child, run_id, claim_lock, scope
+
+    def test_standalone_parent_reopen_defers_prespawn_child_until_pid_exists(self) -> None:
+        parent, child, run_id, claim_lock, scope = self._prespawn_descendant()
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("not-yet-created scope must not be stopped"),
+        ):
+            result = kb.invalidate_descendants_for_parent_reopen(
+                self.conn, parent, author="operator"
+            )
+            finalized = kbd._reconcile_pending_descendant_invalidations(self.conn)
+
+        self.assertEqual(result["terminations"], [])
+        self.assertEqual(result["deferred"][0]["reason"], "worker_identity_incomplete")
+        self.assertEqual(finalized, [])
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["claim_lock"], claim_lock)
+        self.assertIsNone(row["worker_pid"])
+
+        kbd._set_worker_pid(self.conn, child, 585858, scope_unit=scope)
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            return_value={"terminated": True, "scope_stopped": True, "scope_unit": scope},
+        ) as terminate:
+            finalized = kbd._reconcile_pending_descendant_invalidations(self.conn)
+        self.assertEqual(finalized, [child])
+        terminate.assert_called_once_with(585858, claim_lock, scope_unit=scope)
+        self.assertEqual(kb.get_task(self.conn, child).status, "todo")
+
+    def test_caller_transaction_never_hands_prespawn_scope_to_terminator(self) -> None:
+        parent, child, run_id, claim_lock, scope = self._prespawn_descendant()
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            side_effect=AssertionError("caller-owned transaction must not schedule pre-spawn stop"),
+        ):
+            with kb.write_txn(self.conn):
+                result = kb.invalidate_descendants_for_parent_reopen(
+                    self.conn, parent, author="dashboard"
+                )
+                self.assertEqual(result["terminations"], [])
+                self.assertEqual(result["deferred"][0]["reason"], "worker_identity_incomplete")
+
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["claim_lock"], claim_lock)
+        self.assertIsNone(row["worker_pid"])
+
+        kbd._set_worker_pid(self.conn, child, 595959, scope_unit=scope)
+        with patch.object(
+            kb,
+            "_terminate_reclaimed_worker",
+            return_value={"terminated": True, "scope_stopped": True, "scope_unit": scope},
+        ) as terminate:
+            finalized = kbd._reconcile_pending_descendant_invalidations(self.conn)
+        self.assertEqual(finalized, [child])
+        terminate.assert_called_once_with(595959, claim_lock, scope_unit=scope)
+        self.assertEqual(kb.get_task(self.conn, child).status, "todo")
+
+    def test_descendant_scope_identity_drift_after_stop_proof_retains_owner(self) -> None:
+        parent, child, run_id, claim_lock, scope = self._running_descendant(pid=606060)
+        with kb.write_txn(self.conn):
+            result = kb.invalidate_descendants_for_parent_reopen(
+                self.conn, parent, author="dashboard"
+            )
+        plan = result["terminations"][0]
+        with kb.write_txn(self.conn):
+            self.conn.execute(
+                "UPDATE task_runs SET worker_scope_unit=? WHERE id=?",
+                (scope.replace(".scope", "-replacement.scope"), run_id),
+            )
+        outcome = kb._finalize_descendant_invalidation_after_termination(
+            self.conn,
+            plan,
+            {"terminated": True, "scope_stopped": True, "scope_unit": scope},
+            author="dashboard",
+        )
+        self.assertEqual(outcome["state"], "stale")
+        row = self.conn.execute(
+            "SELECT status,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["current_run_id"], run_id)
+        self.assertEqual(row["claim_lock"], claim_lock)
+        self.assertEqual(row["worker_pid"], 606060)
+
+
 if __name__ == "__main__":
     unittest.main()

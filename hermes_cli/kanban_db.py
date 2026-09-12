@@ -3458,9 +3458,28 @@ def _finalize_descendant_invalidation_after_termination(
     expected_lock = plan.get("claim_lock")
     resume_status = str(plan.get("resume_status") or "ready")
 
+    if not _complete_worker_generation(
+        expected_run_id, expected_pid, expected_lock, plan.get("scope_unit")
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "descendant_invalidation_deferred",
+                {
+                    "ancestor": ancestor,
+                    "reason": "worker_identity_incomplete",
+                    "resume_status": resume_status,
+                    "worker_pid": expected_pid,
+                    "claim_lock": expected_lock,
+                    "scope_unit": plan.get("scope_unit"),
+                },
+                run_id=expected_run_id,
+            )
+        return {"state": "deferred", "id": task_id, "termination": termination}
+
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id = ?",
+            "SELECT t.status,t.current_run_id,t.worker_pid,t.claim_lock,r.worker_scope_unit "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id = ?",
             (task_id,),
         ).fetchone()
         scope_unit = str(plan.get("scope_unit") or "").strip()
@@ -3492,6 +3511,7 @@ def _finalize_descendant_invalidation_after_termination(
             and row["current_run_id"] == expected_run_id
             and row["worker_pid"] == expected_pid
             and row["claim_lock"] == expected_lock
+            and row["worker_scope_unit"] == scope_unit
         )
         if not ownership_matches:
             if row is not None:
@@ -3550,6 +3570,33 @@ _FORCED_RUNNING_LIFECYCLE = frozenset({
     "forced_running_transition_completed",
     "forced_running_transition_stale",
 })
+
+
+def _complete_worker_generation(
+    run_id: Any,
+    worker_pid: Any,
+    claim_lock: Any,
+    scope_unit: Any,
+) -> bool:
+    """Return whether one worker generation is complete enough to terminate.
+
+    ``worker_scope_unit`` is deliberately persisted before ``systemd-run`` is
+    spawned. During that short window a scope name exists in durable state but
+    no worker PID exists yet. Treating an inactive/not-yet-created scope as
+    proof of death would release the claim while the already-authorized spawn
+    can still complete. Any path that may release a running owner must bind to
+    the full run/claim/PID/scope generation first.
+    """
+    try:
+        pid = int(worker_pid)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        run_id
+        and pid > 0
+        and str(claim_lock or "").strip()
+        and str(scope_unit or "").strip()
+    )
 
 
 def _forced_running_owner_row(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
@@ -3863,9 +3910,36 @@ def _finalize_direct_status_transition_after_termination(
     effective_status = str(plan.get("effective_status") or requested_status)
     scope_unit = str(plan.get("scope_unit") or "").strip()
 
+    if not _complete_worker_generation(
+        expected_run_id, expected_pid, expected_lock, scope_unit
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "direct_status_transition_deferred",
+                {
+                    "reason": "worker_identity_incomplete",
+                    "requested_status": requested_status,
+                    "effective_status": effective_status,
+                    "worker_pid": expected_pid,
+                    "claim_lock": expected_lock,
+                    "scope_unit": scope_unit or None,
+                    "author": author,
+                },
+                run_id=expected_run_id,
+            )
+        return {
+            "state": "deferred",
+            "id": task_id,
+            "status": "running",
+            "termination": termination,
+        }
+
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status,current_run_id,worker_pid,claim_lock FROM tasks WHERE id = ?",
+            "SELECT t.status,t.current_run_id,t.worker_pid,t.claim_lock,r.worker_scope_unit "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id WHERE t.id = ?",
             (task_id,),
         ).fetchone()
         scope_proven = bool(
@@ -3904,6 +3978,7 @@ def _finalize_direct_status_transition_after_termination(
             and row["current_run_id"] == expected_run_id
             and row["worker_pid"] == expected_pid
             and row["claim_lock"] == expected_lock
+            and row["worker_scope_unit"] == scope_unit
         )
         if not ownership_matches:
             if row is not None:
@@ -4011,7 +4086,8 @@ def transition_running_status_fail_closed(
             )
             return {"state": "deferred", "id": task_id, "status": "running"}
 
-        if not str(row["worker_scope_unit"] or "").strip():
+        scope_unit = str(row["worker_scope_unit"] or "").strip()
+        if not scope_unit:
             _append_event(
                 conn,
                 task_id,
@@ -4022,6 +4098,25 @@ def transition_running_status_fail_closed(
                     "worker_pid": row["worker_pid"],
                     "claim_lock": row["claim_lock"],
                     "scope_unit": None,
+                    "author": author,
+                },
+                run_id=row["current_run_id"],
+            )
+            return {"state": "deferred", "id": task_id, "status": "running"}
+
+        if not _complete_worker_generation(
+            row["current_run_id"], row["worker_pid"], row["claim_lock"], scope_unit
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "direct_status_transition_deferred",
+                {
+                    "reason": "worker_identity_incomplete",
+                    "requested_status": requested_status,
+                    "worker_pid": row["worker_pid"],
+                    "claim_lock": row["claim_lock"],
+                    "scope_unit": scope_unit,
                     "author": author,
                 },
                 run_id=row["current_run_id"],
@@ -4114,15 +4209,48 @@ def invalidate_descendants_for_parent_reopen(
             resume_status = "review" if previous_status == "review" else "ready"
             if previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
+                scope_unit = str(row["worker_scope_unit"] or "").strip()
                 plan = {
                     "id": row["id"],
                     "ancestor": task_id,
                     "run_id": row["current_run_id"],
                     "worker_pid": row["worker_pid"],
                     "claim_lock": row["claim_lock"],
-                    "scope_unit": row["worker_scope_unit"],
+                    "scope_unit": scope_unit or None,
                     "resume_status": resume_status,
                 }
+                if not row["current_run_id"]:
+                    reason = "running_task_missing_current_run"
+                elif not scope_unit:
+                    reason = "worker_scope_missing"
+                elif not _complete_worker_generation(
+                    row["current_run_id"], row["worker_pid"], row["claim_lock"], scope_unit
+                ):
+                    reason = "worker_identity_incomplete"
+                else:
+                    reason = None
+                if reason is not None:
+                    _append_event(
+                        conn, row["id"], "descendant_invalidation_deferred",
+                        {
+                            "ancestor": task_id,
+                            "reason": reason,
+                            "prior_status": "running",
+                            "new_status": "todo",
+                            "resume_status": resume_status,
+                            "worker_pid": row["worker_pid"],
+                            "claim_lock": row["claim_lock"],
+                            "scope_unit": scope_unit or None,
+                        },
+                        run_id=row["current_run_id"],
+                    )
+                    deferred.append({
+                        "state": "deferred",
+                        "id": row["id"],
+                        "reason": reason,
+                        "run_id": row["current_run_id"],
+                    })
+                    continue
                 _append_event(
                     conn, row["id"], "descendant_invalidation_pending",
                     {
@@ -4132,7 +4260,7 @@ def invalidate_descendants_for_parent_reopen(
                         "resume_status": resume_status,
                         "worker_pid": row["worker_pid"],
                         "claim_lock": row["claim_lock"],
-                        "scope_unit": row["worker_scope_unit"],
+                        "scope_unit": scope_unit,
                     },
                     run_id=row["current_run_id"],
                 )

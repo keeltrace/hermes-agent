@@ -703,6 +703,7 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                expected_generation=generation,
             )
             continue
 
@@ -802,6 +803,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 now,
                 termination,
                 reason="orphaned_running_scope_not_reaped",
+                expected_generation=generation,
             )
             continue
         with _kb.write_txn(conn):

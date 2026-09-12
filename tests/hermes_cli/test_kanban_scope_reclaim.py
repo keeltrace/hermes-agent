@@ -643,5 +643,61 @@ class KanbanWorkerScopeReclaimTests(unittest.TestCase):
         self.assertIn(str(replacement_run), event["payload"])
 
 
+    def test_reclaim_defer_is_bound_to_exact_generation_not_claim_token(self) -> None:
+        old_scope = "hermes-worker-kanban-defer-old-run-1.scope"
+        old_run = self._running_task("defer-generation", pid=828282, scope=old_scope)
+        old_generation = kb._running_worker_generation_row(self.conn, "defer-generation")
+        self.assertIsNotNone(old_generation)
+        shared_claim = old_generation["claim_lock"]
+        now = int(time.time())
+        replacement_expiry = now + 90
+        cur = self.conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id,profile,status,claim_lock,claim_expires,worker_pid,worker_scope_unit,started_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "defer-generation",
+                "default",
+                "running",
+                shared_claim,
+                replacement_expiry,
+                838383,
+                "hermes-worker-kanban-defer-new-run-2.scope",
+                now,
+            ),
+        )
+        replacement_run = int(cur.lastrowid)
+        self.conn.execute(
+            "UPDATE tasks SET current_run_id=?,worker_pid=?,claim_lock=?,claim_expires=?,started_at=? "
+            "WHERE id='defer-generation'",
+            (replacement_run, 838383, shared_claim, replacement_expiry, now),
+        )
+        before_events = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id='defer-generation' AND kind='reclaim_deferred'"
+        ).fetchone()["n"]
+
+        kbd._defer_reclaim_for_live_worker(
+            self.conn,
+            "defer-generation",
+            shared_claim,
+            now,
+            {"terminated": False, "termination_attempted": True},
+            reason="stale_old_generation",
+            expected_generation=old_generation,
+        )
+
+        row = self.conn.execute(
+            "SELECT current_run_id,worker_pid,claim_expires FROM tasks WHERE id='defer-generation'"
+        ).fetchone()
+        self.assertEqual(row["current_run_id"], replacement_run)
+        self.assertNotEqual(row["current_run_id"], old_run)
+        self.assertEqual(row["worker_pid"], 838383)
+        self.assertEqual(row["claim_expires"], replacement_expiry)
+        after_events = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id='defer-generation' AND kind='reclaim_deferred'"
+        ).fetchone()["n"]
+        self.assertEqual(after_events, before_events)
+
+
 if __name__ == "__main__":
     unittest.main()

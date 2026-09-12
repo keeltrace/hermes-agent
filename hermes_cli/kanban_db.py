@@ -2442,6 +2442,7 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
             _defer_reclaim_for_live_worker(
                 conn, row["id"], generation["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                expected_generation=generation,
             )
             continue
         with write_txn(conn):
@@ -2571,6 +2572,7 @@ def reclaim_task(
                 int(time.time()),
                 termination,
                 reason="manual_reclaim_worker_alive",
+                expected_generation=row,
             )
         return False
     with write_txn(conn):

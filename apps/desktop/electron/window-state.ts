@@ -76,10 +76,50 @@ interface WindowOptions {
   y?: number
 }
 
-// Sanitized state (or null) → BrowserWindow size/position options. Always sets
-// width/height, capped to the largest current display so a size saved on a
-// since-disconnected bigger monitor can't exceed any screen the user now has.
-// Sets x/y only when still on-screen; otherwise Electron centers the window.
+function workAreaForBounds(bounds, displays) {
+  const areas = (Array.isArray(displays) ? displays : [])
+    .map(display => display?.workArea)
+    .filter(
+      a =>
+        a &&
+        finite(a.x) &&
+        finite(a.y) &&
+        finite(a.width) &&
+        finite(a.height) &&
+        a.width > 0 &&
+        a.height > 0
+    )
+
+  // A saved x/y is the window's anchor. Prefer the display containing that
+  // anchor; if the anchor itself fell off-screen after a monitor/work-area
+  // change, use the display with the largest remaining overlap.
+  const anchored = areas.find(
+    a => bounds.x >= a.x && bounds.x < a.x + a.width && bounds.y >= a.y && bounds.y < a.y + a.height
+  )
+  if (anchored) {
+    return anchored
+  }
+
+  let best = null
+  let bestOverlap = 0
+  for (const a of areas) {
+    const overlapWidth = Math.max(0, Math.min(bounds.x + bounds.width, a.x + a.width) - Math.max(bounds.x, a.x))
+    const overlapHeight = Math.max(0, Math.min(bounds.y + bounds.height, a.y + a.height) - Math.max(bounds.y, a.y))
+    const overlap = overlapWidth * overlapHeight
+    if (overlap > bestOverlap) {
+      best = a
+      bestOverlap = overlap
+    }
+  }
+  return best
+}
+
+// Sanitized state (or null) → BrowserWindow size/position options. With no
+// usable saved position, width/height are capped to the largest current display
+// so a size saved on a disconnected bigger monitor stays usable. With a saved
+// on-screen position, size and position are clamped to that display's work area
+// so Windows never receives restored bounds extending behind the taskbar or
+// outside the monitor (which can make BrowserWindow boot minimized/invisible).
 function computeWindowOptions(state, displays): WindowOptions {
   const opts: WindowOptions = {
     width: finite(state?.width) ? state.width : DEFAULT_WIDTH,
@@ -99,14 +139,19 @@ function computeWindowOptions(state, displays): WindowOptions {
     opts.height = clamp(opts.height, MIN_HEIGHT, cap.height)
   }
 
-  if (
-    state &&
-    finite(state.x) &&
-    finite(state.y) &&
-    onScreen({ x: state.x, y: state.y, width: opts.width, height: opts.height }, displays)
-  ) {
-    opts.x = state.x
-    opts.y = state.y
+  if (state && finite(state.x) && finite(state.y)) {
+    const bounds = { x: state.x, y: state.y, width: opts.width, height: opts.height }
+    if (onScreen(bounds, displays)) {
+      const area = workAreaForBounds(bounds, displays)
+      // A display smaller than BrowserWindow's minimum cannot contain the
+      // window. In that impossible case, omit x/y and let Electron center it.
+      if (area && area.width >= MIN_WIDTH && area.height >= MIN_HEIGHT) {
+        opts.width = clamp(opts.width, MIN_WIDTH, area.width)
+        opts.height = clamp(opts.height, MIN_HEIGHT, area.height)
+        opts.x = clamp(state.x, area.x, area.x + area.width - opts.width)
+        opts.y = clamp(state.y, area.y, area.y + area.height - opts.height)
+      }
+    }
   }
 
   return opts

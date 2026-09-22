@@ -475,50 +475,73 @@ _storage_opt_ok: Optional[bool] = None  # cached result across instances
 _cgroup_limits_ok: Optional[bool] = None  # cached result across instances
 
 
-def _cgroup_limits_available(image: str) -> bool:
-    """Probe once per process whether ``--cpus``/``--memory``/``--pids-limit`` work here, via a
-    throwaway ``sleep 0`` container from *image* (no extra pull). Without delegated cgroup
-    controllers (unprivileged LXCs, rootless) these flags fail every start with exit 126;
-    the result is host-wide, so it is cached. Only DEFINITIVE answers are cached: a probe
-    that could not run (auto-pull past the timeout, daemon cold-start, manifest/pull error)
-    says nothing about cgroup support, so it degrades this spawn and is retried on the next."""
+def _cgroup_limits_available(image: str, endpoint_selector=None) -> bool:
+    """Probe cgroup resource flags on the selected Docker daemon.
+
+    The ambient endpoint keeps the historical definitive-only process cache.
+    Pinned endpoints are probed independently so local daemon results cannot
+    leak across Docker contexts/hosts.
+    """
     global _cgroup_limits_ok
-    if _cgroup_limits_ok is not None:
+    if endpoint_selector is None and _cgroup_limits_ok is not None:
         return _cgroup_limits_ok
 
     docker_exe = find_docker()
     if not docker_exe or not image:
-        return False  # not cached: docker may appear later in this process
+        return False
 
     try:
         result = run_capture(
-            [docker_exe, "run", "--rm", "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
-             image, "sleep", "0"],
-            timeout=60)
-    except Exception as e:
-        logger.warning("Cgroup limit probe failed; containers run without "
-                       "CPU/memory/PID limits until a probe succeeds: %s", e)
+            [
+                docker_exe,
+                *_endpoint_cli_args(endpoint_selector),
+                "run",
+                "--rm",
+                "--cpus",
+                "0.5",
+                "--memory",
+                "64m",
+                "--pids-limit",
+                "32",
+                image,
+                "sleep",
+                "0",
+            ],
+            timeout=60,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Cgroup limit probe failed; containers run without CPU/memory/PID "
+            "limits until a probe succeeds: %s",
+            exc,
+        )
         return False
+
     if result.returncode == 0:
-        _cgroup_limits_ok = True
+        if endpoint_selector is None:
+            _cgroup_limits_ok = True
         return True
+
     stderr = (result.stderr or "").strip()
     if "cgroup" not in stderr.lower():
-        # Pull/manifest/daemon errors say nothing about cgroup support: not cached.
         logger.warning(
             "Cgroup limit probe could not determine support (docker exited %d: %s). "
             "Containers run without CPU/memory/PID limits until a probe succeeds.",
-            result.returncode, stderr[:500])
+            result.returncode,
+            stderr[:500],
+        )
         return False
-    _cgroup_limits_ok = False
-    logger.warning(
-        "Cgroup resource limits (--cpus/--memory/--pids-limit) not "
-        "available in this environment. Containers will run without "
-        "CPU, memory or PID limits. To enable, delegate the cpu, "
-        "memory and pids cgroup controllers to this container. Probe stderr: %s",
-        stderr[:500])
-    return False
 
+    if endpoint_selector is None:
+        _cgroup_limits_ok = False
+    logger.warning(
+        "Cgroup resource limits (--cpus/--memory/--pids-limit) not available "
+        "in this environment. Containers will run without CPU, memory or PID "
+        "limits. To enable, delegate the cpu, memory and pids cgroup "
+        "controllers to this container. Probe stderr: %s",
+        stderr[:500],
+    )
+    return False
 
 def _docker_unavailable(log_msg: str, *log_args, error: str, hint: str, exc_info: bool = False):
     logger.error(log_msg, *log_args, exc_info=exc_info)
@@ -536,7 +559,7 @@ def _ensure_docker_available(endpoint_selector=None) -> None:
                   "Install Docker and ensure the 'docker' command is available.",
             hint="Install Docker (or fix PATH) and retry, or run `hermes setup terminal` to switch to Local.")
     try:
-        result = run_capture([docker_exe, "version"], timeout=5)
+        result = run_capture([docker_exe, *_endpoint_cli_args(endpoint_selector), "version"], timeout=5)
     except FileNotFoundError:
         raise _docker_unavailable(
             "Docker backend selected but the resolved docker executable '%s' could not be executed.",
@@ -1230,36 +1253,47 @@ class DockerEnvironment(BaseEnvironment):
             result = super().execute(command, cwd, **kwargs)
         return result
 
-    @staticmethod
-    def _storage_opt_supported() -> bool:
-        """Whether ``--storage-opt size=`` works (only overlay2 on XFS with pquota; ext4 errors out).
-        Only definitive answers are cached: a probe that could not run (daemon cold-start,
-        hello-world pull timeout) says nothing about pquota support and is retried next spawn."""
+    def _storage_opt_supported(self) -> bool:
+        """Whether --storage-opt size= works on the selected Docker daemon.
+
+        Only definitive ambient-endpoint answers are cached. Pinned endpoint
+        probes are isolated so one daemon's storage driver cannot authorize
+        another daemon.
+        """
         global _storage_opt_ok
-        if _storage_opt_ok is not None:
+        if not self._pin_args and _storage_opt_ok is not None:
             return _storage_opt_ok
         try:
-            docker = find_docker() or "docker"
-            result = run_capture([docker, "info", "--format", "{{.Driver}}"], timeout=10)
+            result = run_capture(
+                [*self._docker_prefix, "info", "--format", "{{.Driver}}"],
+                timeout=10,
+            )
             if result.returncode != 0:
-                return False  # daemon unreachable etc. is transient; retry next spawn
-            if result.stdout.strip().lower() != "overlay2":
-                _storage_opt_ok = False  # storage driver is a host property
                 return False
-            # Probe with a real create — the fastest reliable check.
-            probe = run_capture([docker, "create", "--storage-opt", "size=1m", "hello-world"], timeout=15)
+            if result.stdout.strip().lower() != "overlay2":
+                if not self._pin_args:
+                    _storage_opt_ok = False
+                return False
+            probe = run_capture(
+                [*self._docker_prefix, "create", "--storage-opt", "size=1m", "hello-world"],
+                timeout=15,
+            )
             if probe.returncode == 0:
-                _storage_opt_ok = True
+                if not self._pin_args:
+                    _storage_opt_ok = True
                 if probe.stdout.strip():
-                    subprocess.run([docker, "rm", probe.stdout.strip()],
-                                   capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
-            elif "storage" in (probe.stderr or "").lower():
-                _storage_opt_ok = False  # daemon rejected --storage-opt: a host property
-            # else: pull/daemon failure unrelated to storage-opt; not cached, retried next spawn
+                    subprocess.run(
+                        [*self._docker_prefix, "rm", probe.stdout.strip()],
+                        capture_output=True,
+                        timeout=5,
+                        stdin=subprocess.DEVNULL,
+                    )
+                return True
+            if "storage" in (probe.stderr or "").lower() and not self._pin_args:
+                _storage_opt_ok = False
+            return False
         except Exception:
-            return False  # TimeoutExpired, missing binary; transient, retried next spawn
-        logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
-        return _storage_opt_ok or False
+            return False
 
     def _container_network_mode(self, container_id: str) -> Optional[str]:
         """``HostConfig.NetworkMode`` of a container, or ``None`` when inspection fails (callers

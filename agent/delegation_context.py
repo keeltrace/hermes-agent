@@ -214,11 +214,6 @@ def non_dispatcher_owned_context() -> Iterator[None]:
         exit_non_dispatcher_owned_context(token)
 
 
-def is_dispatcher_owned_worker_context() -> bool:
-    """The single predicate every ``HERMES_KANBAN_*`` identity gate should use."""
-    return not (is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get())
-
-
 def owned_kanban_task() -> str:
     """The board task this execution OWNS: ``HERMES_KANBAN_TASK`` for the dispatcher-owned
     worker, ``""`` otherwise. Tool access is not worker identity — a profile can expose the

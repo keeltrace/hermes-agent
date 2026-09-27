@@ -8,6 +8,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
+from hermes_cli import legacy_uv
 from hermes_cli.colors import Colors, color
 
 def _logger(mark: str, col: str):
@@ -368,8 +369,8 @@ _GATEWAY_SERVICE_REMOVERS = {
 
 def _hermes_path_markers(hermes_home: Path, *, include_managed_bin: bool = False) -> list[str]:
     """Prefixes identifying Hermes-owned User-PATH entries (prefix match sweeps git\cmd, git\bin,
-    node...). ``include_managed_bin`` adds ``<root>\bin`` (launchers + managed uv) — only when that
-    dir is about to be deleted, so a keep-data uninstall keeps the working uv resolvable."""
+    node...). ``include_managed_bin`` adds ``<root>\bin`` (launchers; a pre-PM uv can still sit
+    there) — only when that dir is about to be deleted, so a keep-data uninstall keeps it resolvable."""
     root = str(hermes_home).rstrip("\\/")
     subs = ("hermes-agent", "git", "node", "venv") + (("bin",) if include_managed_bin else ())
     return [f"{root}\\{sub}" for sub in subs]
@@ -505,8 +506,8 @@ def remove_legacy_runtime_trees(hermes_home: Path) -> list[Path]:
     survives "keep my data" uninstalls, because it is not data.
 
     Only the exact managed layout is removed: ``node/`` (a tree the
-    installer owned wholesale) and ``bin/uv`` (the single binary, NOT the
-    whole ``bin/`` dir — a user's own scripts can live there). Profile
+    installer owned wholesale) and the ``bin/uv`` family (the binaries, NOT
+    the whole ``bin/`` dir — a user's own scripts can live there). Profile
     state is never touched.
     """
     removed: list[Path] = []
@@ -519,14 +520,7 @@ def remove_legacy_runtime_trees(hermes_home: Path) -> list[Path]:
         except Exception as e:
             log_warn(f"Could not remove {node_tree}: {e}")
 
-    for uv_name in ("uv", "uv.exe"):
-        uv_binary = hermes_home / "bin" / uv_name
-        if uv_binary.is_file():
-            try:
-                uv_binary.unlink()
-                removed.append(uv_binary)
-            except Exception as e:
-                log_warn(f"Could not remove {uv_binary}: {e}")
+    removed.extend(legacy_uv.remove_legacy_managed_uv(hermes_home))
 
     return removed
 
@@ -1009,9 +1003,9 @@ def _perform_uninstall(
         log_info("No gateway service or processes found")
 
     # 2-3b. PATH entries, wrapper, Windows launchers, node symlinks. Windows: hermes_home is
-    #    %VAR%-expanded because install.ps1 writes literal C:\Users\<u>\...; hermes\bin (launchers +
-    #    managed uv) leaves the PATH only when the full wipe below deletes it (keep-data keeps uv
-    #    resolvable), while the launchers themselves always go. Symlinks go only when they still
+    #    %VAR%-expanded because install.ps1 writes literal C:\Users\<u>\...; hermes\bin (launchers;
+    #    a pre-PM uv can still sit there) leaves the PATH only when the full wipe below deletes it
+    #    (keep-data keeps it resolvable), while the launchers themselves always go. Symlinks go only when they still
     #    point into this home's node dir (never clobber nvm / user-managed Node).
     windows = _is_windows()
     sweep_managed_bin = windows and full_uninstall and _is_default_hermes_home(hermes_home)

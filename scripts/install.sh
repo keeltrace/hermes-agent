@@ -97,6 +97,39 @@ log_warn() { printf '%s⚠%s %s\n' "$C_YELLOW" "$C_NC" "$1"; }
 log_error() { printf '%s✗%s %s\n' "$C_RED" "$C_NC" "$1" >&2; }
 fail() { STAGE_REASON="$1"; log_error "$1"; exit 1; }
 
+# Resolve the machine-scoped Hermes root from a raw HERMES_HOME/default string
+# before Python is available. This mirrors hermes_constants.get_default_hermes_root()
+# for the bootstrap cases that matter here: keep the shell's existing expansion behavior
+# and preserve leading // and meaningful .. path components, but ignore raw aliases that pathlib
+# normalizes away before asking whether the immediate parent is named profiles
+# (a repeated separator before the profile name, or a trailing /. segment).
+default_hermes_root_from_home() {
+    local root="$1"
+    # Match pathlib's trailing separator / single-dot aliases for the immediate-parent
+    # test only. Do not lexical-clean the whole path: leading // and ../ can be
+    # meaningful to the shell and filesystem.
+    while [ "$root" != / ]; do
+        case "$root" in
+            */) root="${root%/}" ;;
+            */.) root="${root%/.}" ;;
+            *) break ;;
+        esac
+    done
+
+    local parent="${root%/*}"
+    local leaf="${root##*/}"
+    # A doubled separator just before the profile name leaves $parent ending in /;
+    # strip only those parent-side trailing separators before reading its basename.
+    while [ "$parent" != / ] && [ "${parent%/}" != "$parent" ]; do
+        parent="${parent%/}"
+    done
+    if [ -n "$leaf" ] && [ "${parent##*/}" = profiles ] && [ "$parent" != "$root" ]; then
+        printf '%s\n' "${parent%/*}"
+    else
+        printf '%s\n' "$root"
+    fi
+}
+
 print_banner() {
     printf '\n%s%s' "$C_MAGENTA" "$C_BOLD"
     printf '%s\n' "┌─────────────────────────────────────────────────────────┐"
@@ -608,8 +641,10 @@ bootstrap_python() {
     # dir is what the `find` below reads back after `python install` writes it.
     # --system still finds a host interpreter, so a machine with one downloads
     # nothing either way.
-    export UV_CACHE_DIR="$HERMES_HOME/cache/uv"
-    export UV_PYTHON_INSTALL_DIR="$HERMES_HOME/cache/uv-python"
+    local hermes_root
+    hermes_root="$(default_hermes_root_from_home "$HERMES_HOME")"
+    export UV_CACHE_DIR="$hermes_root/cache/uv"
+    export UV_PYTHON_INSTALL_DIR="$hermes_root/cache/uv-python"
     local _py
     # Read packages.python.version by following object names and braces, not
     # indentation — same pre-Python reader contract as setup-hermes.sh's pin().

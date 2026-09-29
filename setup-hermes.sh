@@ -63,6 +63,39 @@ mirror_url_for() { # $1 = lowercase sha256
   printf '%s/%s%s' "$mirror_origin" "$mirror_prefix" "$1"
 }
 
+# Resolve the machine-scoped Hermes root from a raw HERMES_HOME/default string
+# before Python is available. This mirrors hermes_constants.get_default_hermes_root()
+# for the bootstrap cases that matter here: keep the shell's existing expansion behavior
+# and preserve leading // and meaningful .. path components, but ignore raw aliases that pathlib
+# normalizes away before asking whether the immediate parent is named profiles
+# (a repeated separator before the profile name, or a trailing /. segment).
+default_hermes_root_from_home() {
+  local root="$1"
+  # Match pathlib's trailing separator / single-dot aliases for the immediate-parent
+  # test only. Do not lexical-clean the whole path: leading // and ../ can be
+  # meaningful to the shell and filesystem.
+  while [ "$root" != / ]; do
+    case "$root" in
+      */) root="${root%/}" ;;
+      */.) root="${root%/.}" ;;
+      *) break ;;
+    esac
+  done
+
+  local parent="${root%/*}"
+  local leaf="${root##*/}"
+  # A doubled separator just before the profile name leaves $parent ending in /;
+  # strip only those parent-side trailing separators before reading its basename.
+  while [ "$parent" != / ] && [ "${parent%/}" != "$parent" ]; do
+    parent="${parent%/}"
+  done
+  if [ -n "$leaf" ] && [ "${parent##*/}" = profiles ] && [ "$parent" != "$root" ]; then
+    printf '%s\n' "${parent%/*}"
+  else
+    printf '%s\n' "$root"
+  fi
+}
+
 case "$(uname -s)" in
   Linux) os=linux ;;
   Darwin) os=darwin ;;
@@ -110,23 +143,7 @@ py_version="$(pin version python | cut -d+ -f1 | cut -d. -f1,2)"
 # store_root() reads that variable, so staging uv anywhere else splits the two
 # and PM re-downloads the very copy this script just verified (and a profile's
 # home would land the store inside the profile).
-hermes_root="${HERMES_HOME:-$HOME/.hermes}"
-# pathlib normalizes trailing separators before PM applies its profile-home
-# rule; do the same here so ``.../profiles/coder/`` resolves identically.
-while [ "$hermes_root" != / ] && [ "${hermes_root%/}" != "$hermes_root" ]; do
-  hermes_root="${hermes_root%/}"
-done
-# Named profiles share the machine-scoped PM store with the default home. Keep
-# the shell bootstrap aligned with pm.environments.store_root(), which folds
-# <default>/profiles/<name> back to <default> before appending tools.
-# Match pm's actual rule: only a path whose immediate parent is named
-# ``profiles`` is a named profile home. This handles custom roots such as
-# ``/tmp/custom/profiles/coder`` without folding unrelated paths that merely
-# contain a ``/profiles/`` segment.
-profile_parent="${hermes_root%/*}"
-if [ "${profile_parent##*/}" = profiles ] && [ "$profile_parent" != "$hermes_root" ]; then
-  hermes_root="${profile_parent%/*}"
-fi
+hermes_root="$(default_hermes_root_from_home "${HERMES_HOME:-$HOME/.hermes}")"
 store="${HERMES_RUNTIME_DIR:-$hermes_root/tools}"
 entry="$store/uv-$uv_version-$target"
 uv="$entry/uv"; [ "$os" = win32 ] && uv="$entry/uv.exe"

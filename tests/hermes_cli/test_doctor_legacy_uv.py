@@ -291,6 +291,51 @@ def test_remove_legacy_uv_stays_anchored_after_a_link_swap(tmp_path, monkeypatch
     assert sentinel.read_text(encoding="utf-8") == "USER-OWNED"
 
 
+@pytest.mark.platforms("posix")
+def test_remove_legacy_uv_refuses_home_identity_swap_before_bin_open(tmp_path, monkeypatch):
+    """A swap between the home identity observation and child acquisition must fail closed.
+
+    This is the narrower KEE-24 race: ``home`` is renamed aside and replaced with a
+    symlink to an external tree before ``bin`` is opened. The final component is still
+    an ordinary directory, so a path-based ``open(home/bin, O_NOFOLLOW)`` would pin
+    and delete from the wrong directory.
+    """
+    from hermes_cli import legacy_uv
+
+    home = tmp_path / "home"
+    external = tmp_path / "external"
+    (home / "bin").mkdir(parents=True)
+    (external / "bin").mkdir(parents=True)
+    for name in legacy_uv.LEGACY_MANAGED_UV_NAMES:
+        (home / "bin" / name).write_text("legacy", encoding="utf-8")
+        (external / "bin" / name).write_text("USER-OWNED", encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(legacy_uv, "_pm_install_lock", lambda: nullcontext())
+    real_stat = legacy_uv.os.stat
+    fired = False
+
+    def swap_after_home_stat(path, *args, **kwargs):
+        nonlocal fired
+        result = real_stat(path, *args, **kwargs)
+        if not fired and Path(path) == home and not kwargs.get("dir_fd"):
+            fired = True
+            home.rename(tmp_path / "saved-home")
+            home.symlink_to(external, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(legacy_uv.os, "stat", swap_after_home_stat)
+
+    assert legacy_uv.remove_legacy_managed_uv(home) == []
+    assert fired
+    for name in legacy_uv.LEGACY_MANAGED_UV_NAMES:
+        assert (external / "bin" / name).read_text(encoding="utf-8") == "USER-OWNED", name
+        assert (tmp_path / "saved-home" / "bin" / name).read_text(encoding="utf-8") == "legacy", name
+
+
 @pytest.mark.platforms("windows")
 def test_remove_legacy_uv_refuses_a_junctioned_bin(tmp_path, monkeypatch):
     """Native Windows twin of the linked-bin refusal: a junction into the user's bin would

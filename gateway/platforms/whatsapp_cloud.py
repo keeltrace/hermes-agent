@@ -213,7 +213,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # the gateway resolver. Popped on tap; FIFO-capped via bounded_put so ignored
         # prompts don't accumulate (an evicted tap degrades to text fallback).
         self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
-        self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
+        self._exec_approval_state: "OrderedDict[str, Any]" = OrderedDict()
         self._slash_confirm_state: "OrderedDict[str, str]" = OrderedDict()
         self._runner = self._http_client = None
 
@@ -282,10 +282,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "[whatsapp_cloud] Listening on %s:%d%s (Graph %s, phone_id=%s)",
                 self._webhook_host, self._webhook_port, self._webhook_path, self._api_version, self._phone_number_id,
             )
-        if not self._verify_token:
-            logger.warning("[whatsapp_cloud] WHATSAPP_CLOUD_VERIFY_TOKEN is not set — the GET subscription handshake will fail until it is.")
-        if not self._app_secret:
-            logger.warning(
+        if not self._verify_[REDACTED]("[whatsapp_cloud] WHATSAPP_CLOUD_VERIFY_TOKEN is not set — the GET subscription handshake will fail until it is.")
+        if not self._app_[REDACTED](
                 "[whatsapp_cloud] WHATSAPP_CLOUD_APP_SECRET is not set — incoming webhook POSTs will be refused "
                 "with 503. Set the app secret to enable inbound message delivery."
             )
@@ -493,7 +491,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             (f"appr:{approval_id}:approve", self._truncate_button_label(t("platform.whatsapp.approve_button"))),
             (f"appr:{approval_id}:deny", self._truncate_button_label(t("platform.whatsapp.deny_button"))))
         return await self._send_interactive(
-            prompt.chat_id, interactive, prompt.metadata, self._exec_approval_state, approval_id, prompt.session_key)
+            prompt.chat_id, interactive, prompt.metadata, self._exec_approval_state, approval_id,
+            (prompt.session_key, prompt.request_id))
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -718,8 +717,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return web.Response(status=400)
         # Without app_secret the sender can't be authenticated → refuse (same
         # posture as the GET handshake refusing without verify_token).
-        if not self._app_secret:
-            logger.error("[whatsapp_cloud] webhook POST refused: app_secret unset. Set WHATSAPP_CLOUD_APP_SECRET to enable inbound delivery.")
+        if not self._app_[REDACTED]("[whatsapp_cloud] webhook POST refused: app_secret unset. Set WHATSAPP_CLOUD_APP_SECRET to enable inbound delivery.")
             return web.Response(status=503, text="app_secret not configured")
         signature_header = request.headers.get("X-Hub-Signature-256", "")
         if not self._verify_signature(raw, signature_header):
@@ -866,171 +864,4 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 logger.info("[whatsapp_cloud] clarify 'Other' tap but entry missing (clarify_id=%s); falling back to text", clarify_id)
                 return False
             # Keep the mapping live for further taps on the same prompt.
-            self._clarify_state[clarify_id] = session_key
-            await self._reply_best_effort(to, t("platform.whatsapp.clarify_type_answer"), "[whatsapp_cloud] clarify other-prompt failed")
-            return True
-        try:
-            idx = int(choice)
-        except ValueError:
-            logger.warning("[whatsapp_cloud] clarify tap had non-int choice: %r", choice)
-            self._clarify_state[clarify_id] = session_key  # a follow-up text can still resolve
-            return False
-        # Title is the numeric label; the agent has the prompt in context to interpret it.
-        if not clarify_gateway.resolve_gateway_clarify(clarify_id, str(inner.get("title") or str(idx + 1))):
-            logger.info("[whatsapp_cloud] clarify resolver reported no waiter (clarify_id=%s) — falling back to text", clarify_id)
-            return False
-        return True
-
-    async def _handle_approval_tap(self, to: str, inner: Dict[str, Any], parts: list) -> bool:
-        _, approval_id, choice = parts
-        session_key = self._pop_tap_state(
-            self._exec_approval_state, approval_id,
-            "[whatsapp_cloud] approval tap with no matching state (approval_id=%s) — likely stale; falling back to text",
-            choice, ("approve", "deny"),
-        )
-        if not session_key:
-            return False
-        approval = _optional_module("tools.approval", "[whatsapp_cloud] approval resolver unavailable")
-        if approval is None:
-            return False
-        count = approval.resolve_gateway_approval(session_key, choice)
-        # A tap after the wait timed out (count == 0) must not claim approval:
-        # the command was already denied fail-closed.
-        if count:
-            confirm_text = t("platform.whatsapp.approved" if choice == "approve" else "platform.whatsapp.denied")
-        else:
-            logger.info("[whatsapp_cloud] approval resolver reported no waiter (session_key=%s) — likely already resolved", session_key)
-            confirm_text = t("platform.whatsapp.approval_expired")
-        await self._reply_best_effort(to, confirm_text, "[whatsapp_cloud] approval confirm failed")
-        return True
-
-    async def _handle_slash_confirm_tap(self, to: str, inner: Dict[str, Any], parts: list) -> bool:
-        _, choice, confirm_id = parts
-        session_key = self._pop_tap_state(
-            self._slash_confirm_state, confirm_id,
-            "[whatsapp_cloud] slash_confirm tap with no matching state (confirm_id=%s) — likely stale",
-            choice, ("once", "always", "cancel"),
-        )
-        if not session_key:
-            return False
-        slash_confirm = _optional_module("tools.slash_confirm", "[whatsapp_cloud] slash_confirm resolver unavailable")
-        if slash_confirm is None:
-            return False
-        try:
-            result_text = await slash_confirm.resolve(session_key, confirm_id, choice)
-        except Exception:
-            logger.exception("[whatsapp_cloud] slash_confirm.resolve failed")
-            return True  # still claim the tap; surfacing it as text wouldn't help
-        if result_text:
-            await self._reply_best_effort(to, result_text, "[whatsapp_cloud] slash_confirm reply failed")
-        return True
-
-    _INTERACTIVE_HANDLERS = {"cl:": _handle_clarify_tap, "appr:": _handle_approval_tap, "sc:": _handle_slash_confirm_tap}
-
-    async def _collect_inbound_media(self, msg_type_str: str, raw_message: Dict[str, Any], body: str) -> tuple[list[str], list[str], str]:
-        """Download inbound media by ``media_id``; returns ``(media_urls, media_types, body)``."""
-        inner = raw_message.get(msg_type_str) or {}
-        media_id, inbound_mime = str(inner.get("id") or "").strip(), str(inner.get("mime_type") or "").strip()
-        if not media_id:
-            return [], [], body
-        local_path, dl_mime = await self._download_media_to_cache(media_id, ext_hint=_ext_for_mime(inbound_mime))
-        if local_path:
-            logger.info("[whatsapp_cloud] cached inbound %s media: %s", msg_type_str, local_path)
-        else:
-            logger.warning(
-                "[whatsapp_cloud] failed to download inbound %s (id=%s) — agent will see message metadata but not the binary",
-                msg_type_str, media_id,
-            )
-        fname = str(inner.get("filename") or "").strip() if msg_type_str == "document" else ""
-        body = body or (f"[Document: {fname}]" if fname else body)
-        if not local_path:
-            return [], [], body
-        return [local_path], [dl_mime or inbound_mime or "application/octet-stream"], body
-
-    @staticmethod
-    def _inject_document_text(media_urls: list[str], body: str) -> tuple[str, list[bool]]:
-        """Prepend text-readable document contents (≤100KB) to the body; returns
-        ``(body, media_text_inlined)`` with one flag per ``media_urls`` entry (True = injected)."""
-        inlined = [False] * len(media_urls)
-        for i, doc in enumerate(map(Path, media_urls)):
-            if doc.suffix.lower() not in _TEXT_INJECT_EXTS:
-                continue
-            try:
-                file_size = doc.stat().st_size
-                if file_size > _MAX_TEXT_INJECT_BYTES:
-                    logger.info("[whatsapp_cloud] skipping text injection for %s (%d bytes > %d)", doc, file_size, _MAX_TEXT_INJECT_BYTES)
-                    continue
-                injection = f"[Content of {doc.name}]:\n{doc.read_text(encoding='utf-8-sig', errors='replace')}"
-                body = f"{injection}\n\n{body}" if body else injection
-                inlined[i] = True
-            except OSError:
-                logger.exception("[whatsapp_cloud] failed to read document text: %s", doc)
-        return body, inlined
-
-    async def _build_message_event_from_cloud(
-        self, raw_message: Dict[str, Any], contacts_by_waid: Dict[str, str], metadata: Dict[str, Any],
-    ) -> Optional[MessageEvent]:
-        """Convert a Cloud-API message object into a MessageEvent, or None if gated out."""
-        msg_type_str = str(raw_message.get("type") or "text").lower()
-        # Contentless envelopes arrive on the same ``messages`` webhook field and carry no
-        # user utterance; falling through would start a blank agent turn (#90157).
-        if msg_type_str in _CONTENTLESS_KINDS:
-            logger.debug("[whatsapp_cloud] skipping contentless %s envelope (wamid=%s)", msg_type_str, raw_message.get("id"))
-            return None
-        # Button taps route to the gateway resolver BEFORE text dispatch — the
-        # resolver unblocks the waiting agent, so don't also start a fresh turn.
-        if msg_type_str == "interactive" and await self._dispatch_interactive_reply(raw_message, contacts_by_waid):
-            return None
-        extract = _BODY_BY_KIND.get(msg_type_str)
-        body = str(extract(raw_message) or "") if extract else ""
-        chat_id = sender_id = str(raw_message.get("from") or "").strip()
-        sender_name = contacts_by_waid.get(sender_id, "")
-        # DMs only: chat_id == sender wa_id. A ``chat`` field marks a group-shaped
-        # payload (capability-gated by Meta) — refuse rather than treat as a DM.
-        if raw_message.get("chat"):
-            logger.warning(
-                "[whatsapp_cloud] received group-shaped message (chat=%s, wamid=%s) — group support is not yet "
-                "implemented; dropping. Use the Baileys whatsapp adapter for group chats.",
-                raw_message.get("chat"), raw_message.get("id"),
-            )
-            return None
-        if not self._should_process_message({"chatId": chat_id, "senderId": sender_id, "isGroup": False, "body": body}):
-            return None
-        media_urls, media_types, media_text_inlined = [], [], []
-        if msg_type_str in _INBOUND_MEDIA_KINDS:
-            media_urls, media_types, body = await self._collect_inbound_media(msg_type_str, raw_message, body)
-            if msg_type_str == "document" and media_urls:
-                body, media_text_inlined = self._inject_document_text(media_urls, body)
-        # Meta's ``context`` gives only the quoted message's id (+ author), never its text or
-        # bytes; resolve both from rich_sent_store so run.py can build "[Replying to: ...]" and
-        # the quoted attachment reaches the vision/audio pipeline like a direct one.
-        context = raw_message.get("context") or {}
-        reply_to_id = str(context.get("id") or "").strip() or None
-        reply_to_text = rich_sent_store.lookup(chat_id, reply_to_id) if reply_to_id else None
-        # context.from == our business number → user replied to the bot.
-        quoted_from = str(context.get("from") or "").strip()
-        our_number = str(metadata.get("display_phone_number") or "").strip()
-        reply_to_is_own = bool(reply_to_id and quoted_from and our_number) and quoted_from == our_number
-        wamid = str(raw_message.get("id") or "") or None
-        if wamid and chat_id:
-            # Done AFTER gating so filtered messages don't leak typing/read receipts.
-            bounded_put(self._last_inbound_wamid_by_chat, chat_id, wamid, INTERACTIVE_STATE_CACHE_SIZE)
-            if body:
-                await rich_sent_store.record_async(chat_id, wamid, body)
-            if msg_type_str in _INBOUND_MEDIA_KINDS and media_urls:
-                await rich_sent_store.record_media_async(chat_id, wamid, list(zip(media_urls, media_types)))
-        if reply_to_id:
-            for path, mime in rich_sent_store.lookup_media(chat_id, reply_to_id):
-                if path not in media_urls:
-                    media_urls.append(path)
-                    media_types.append(mime)
-        return MessageEvent(
-            text=body, message_type=_MESSAGE_TYPE_BY_KIND.get(msg_type_str, MessageType.TEXT),
-            source=self.build_source(
-                chat_id=chat_id, chat_name=sender_name or chat_id, chat_type="dm",
-                user_id=sender_id, user_name=sender_name or None,
-            ),
-            raw_message=raw_message, message_id=wamid, reply_to_message_id=reply_to_id,
-            reply_to_text=reply_to_text, reply_to_is_own_message=reply_to_is_own,
-            media_urls=media_urls, media_types=media_types, media_text_inlined=media_text_inlined,
-        )
+            self._clarify_state[clarify_id
